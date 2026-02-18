@@ -1,0 +1,148 @@
+version: "3.9"
+
+services:
+  bf1_api:
+    build: .
+    container_name: bf1_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - models_storage:/app/models_storage
+      - logs:/app/logs
+    networks:
+      - bf1_internal
+      - bf1_external
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  bf1_bot:
+    build: .
+    container_name: bf1_bot
+    command: python -m app.telegram.bot
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - logs:/app/logs
+    networks:
+      - bf1_internal
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+
+  bf1_scheduler:
+    build: .
+    container_name: bf1_scheduler
+    command: python -c "from app.scheduler.jobs import scheduler; scheduler.start(); import asyncio; asyncio.get_event_loop().run_forever()"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - models_storage:/app/models_storage
+      - logs:/app/logs
+    networks:
+      - bf1_internal
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bf1_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bf1user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-bf1_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bf1_internal
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bf1user} -d ${POSTGRES_DB:-bf1_2026}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: bf1_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - bf1_internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:alpine
+    container_name: bf1_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - bf1_api
+    networks:
+      - bf1_external
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  models_storage:
+  logs:
+
+networks:
+  bf1_internal:
+    driver: bridge
+  bf1_external:
+    driver: bridge
