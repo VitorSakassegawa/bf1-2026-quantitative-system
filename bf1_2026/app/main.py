@@ -17,6 +17,18 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("BF1-2026 Quantitative System starting up")
 
+    # Ensure database tables exist. For schema migrations in production,
+    # prefer `alembic upgrade head`; this create_all is idempotent and makes
+    # a fresh deploy boot without a manual migration step.
+    try:
+        import app.models  # noqa: F401  (register all ORM models on Base)
+        from app.database import init_db
+
+        await init_db()
+        logger.info("Database tables ensured")
+    except Exception as e:
+        logger.warning(f"Database init skipped/failed: {e}")
+
     # Start scheduler
     try:
         from app.scheduler.jobs import start_scheduler

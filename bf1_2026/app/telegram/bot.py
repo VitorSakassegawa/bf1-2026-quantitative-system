@@ -103,3 +103,7 @@ def run_bot() -> None:
     app = setup_bot()
     logger.info("Starting Telegram bot polling...")
     app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    run_bot()

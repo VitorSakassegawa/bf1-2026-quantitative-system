@@ -58,7 +58,7 @@ services:
   bf1_scheduler:
     build: .
     container_name: bf1_scheduler
-    command: python -c "from app.scheduler.jobs import scheduler; scheduler.start(); import asyncio; asyncio.get_event_loop().run_forever()"
+    command: python -m app.scheduler.run
     env_file:
       - .env
     depends_on:
