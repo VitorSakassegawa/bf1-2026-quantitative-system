@@ -12,6 +12,7 @@ from app.models_ml.monte_carlo import MonteCarloSimulator, SimulationConfig
 from app.models_ml.xgboost_model import XGBoostF1Model
 from app.optimizer.ev_calculator import EVCalculator
 from app.optimizer.token_optimizer import TokenOptimizer
+from app.utils.guardrails import PitStopProjector, validate_prediction
 
 
 class StrategyEngine:
@@ -29,6 +30,7 @@ class StrategyEngine:
         self.mc_simulator = MonteCarloSimulator()
         self.ev_calc = EVCalculator()
         self.optimizer = TokenOptimizer()
+        self.pit_projector = PitStopProjector()
 
     def generate_strategy(
         self,
@@ -39,6 +41,8 @@ class StrategyEngine:
         user_aggressiveness: str = "balanced",
         is_sprint: bool = False,
         n_simulations: int = 20000,
+        is_sprint_weekend: bool | None = None,
+        confidence: float = 0.6,
     ) -> dict:
         """
         Full strategy pipeline:
@@ -125,6 +129,13 @@ class StrategyEngine:
                 ),
                 "expected_value": mc_pred.get("expected_value", 0),
             }
+            # Guardrail: clamp any out-of-domain field before it influences EV.
+            merged_predictions[did] = validate_prediction(
+                merged_predictions[did],
+                grid_size=len(drivers),
+                is_sprint=is_sprint,
+                context=f"strategy:{did}",
+            )
 
         # Step 5: Optimize allocation
         opt_result = self.optimizer.optimize(
@@ -168,9 +179,28 @@ class StrategyEngine:
                 "expected_position": pred.get("expected_position", 10),
             })
 
+        # Bounded pit-stop projection (never emits a physically impossible count).
+        if is_sprint_weekend is None:
+            is_sprint_weekend = is_sprint
+        pit_projection = self.pit_projector.project(
+            tire_degradation=circuit_kpis.get("avg_tire_degradation"),
+            historical_avg_stops=circuit_kpis.get("avg_pit_stops"),
+            confidence=confidence,
+            is_sprint_weekend=is_sprint_weekend,
+            is_sprint_race=is_sprint,
+        )
+
         insights = self._generate_insights(
             driver_details, weather, circuit_kpis, weather_risk
         )
+        # Surface the pit-stop guardrail note so the user understands a capped value.
+        if pit_projection.note:
+            insights.append(pit_projection.note)
+        else:
+            insights.append(
+                f"Projected strategy: {pit_projection.label} "
+                f"(confidence {pit_projection.confidence:.0%})"
+            )
 
         strategy = {
             "allocation": allocation,
@@ -181,6 +211,13 @@ class StrategyEngine:
             "weather_adjusted": opt_result.get("weather_adjusted", False),
             "is_sprint": is_sprint,
             "n_simulations": n_simulations,
+            "pit_stop_projection": {
+                "projected_stops": pit_projection.projected_stops,
+                "label": pit_projection.label,
+                "raw_estimate": pit_projection.raw_estimate,
+                "capped": pit_projection.capped,
+                "note": pit_projection.note,
+            },
             "insights": insights,
         }
 

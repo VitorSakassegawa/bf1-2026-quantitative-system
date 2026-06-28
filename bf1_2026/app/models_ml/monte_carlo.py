@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 import numpy as np
 from loguru import logger
 
+from app.utils.guardrails import (
+    clamp_expected_points,
+    clamp_position,
+    clamp_probability,
+)
 from app.utils.validators import BF1_POINTS_TABLE, BF1_DNF_PENALTY
 
 
@@ -111,11 +116,12 @@ class MonteCarloSimulator:
             dnf_sim = float(dnf_series.mean())
             avg_pts = float(pts_series.mean()) * sprint_mult
 
+            avg_pts = clamp_expected_points(avg_pts, is_sprint)
             results[did] = {
-                "avg_position": round(avg_pos, 2),
-                "top3_probability": round(top3_prob, 4),
-                "top10_probability": round(top10_prob, 4),
-                "dnf_probability_simulated": round(dnf_sim, 4),
+                "avg_position": round(clamp_position(avg_pos, n_drivers), 2),
+                "top3_probability": round(clamp_probability(top3_prob), 4),
+                "top10_probability": round(clamp_probability(top10_prob), 4),
+                "dnf_probability_simulated": round(clamp_probability(dnf_sim), 4),
                 "expected_bf1_points": round(avg_pts, 2),
                 "position_distribution": pos_dist,
                 "expected_value": round(avg_pts, 2),

@@ -16,6 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 from app.config import settings
 from app.models_ml.model_registry import ModelRegistry
+from app.utils.guardrails import validate_prediction
 
 try:
     import xgboost as xgb
@@ -261,13 +262,16 @@ class XGBoostF1Model:
             expected_pts = expected_pts * (1 - dnf_prob) + dnf_prob * (-10)
 
             results.append(
-                {
-                    "expected_position": round(pos, 2),
-                    "top3_probability": round(min(top3_prob, 1.0), 4),
-                    "top10_probability": round(min(top10_prob, 1.0), 4),
-                    "dnf_probability": round(min(dnf_prob, 1.0), 4),
-                    "expected_points": round(expected_pts, 2),
-                }
+                validate_prediction(
+                    {
+                        "expected_position": pos,
+                        "top3_probability": top3_prob,
+                        "top10_probability": top10_prob,
+                        "dnf_probability": dnf_prob,
+                        "expected_points": expected_pts,
+                    },
+                    context="xgboost.predict",
+                )
             )
 
         return results

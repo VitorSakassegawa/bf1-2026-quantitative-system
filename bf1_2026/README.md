@@ -178,6 +178,28 @@ PyMC model with driver-level priors that naturally capture uncertainty. Updated 
 
 **Derived:** momentum, volatility, risk index, opportunity index, form trend
 
+## Guardrails (Anti-Hallucination)
+
+Models trained on sparse or unstable data can emit values outside the physical
+or regulatory domain of F1 (e.g. a "5 pit stop" projection, a probability above
+1.0, or a finishing position of 0). `app/utils/guardrails.py` is a central layer
+that **clamps every model output and logs a warning whenever a raw value had to
+be corrected** — so out-of-domain behavior is detected, not silently passed on.
+
+| Guardrail | Bound |
+|-----------|-------|
+| Pit stops, dry GP | 1–3 (4 only with high confidence **and** extreme degradation) |
+| Pit stops, Sprint **weekend** | max 2 (fewer fresh tyre sets remain) |
+| Pit stops, Sprint **race** | 0–1 |
+| Low confidence (<40%) | anchors to the historical norm instead of extrapolating |
+| Probabilities | clamped to [0, 1]; `P(top3) ≤ P(top10)` enforced |
+| Finishing position | clamped to [1, grid size] |
+| Expected points | clamped to [−10 (DNF), 26] (×2 on sprints) |
+
+The `PitStopProjector` treats an extreme raw estimate as a **critical-degradation
+signal** (a tyre-management race), not as a literal stop count — and says so in
+the strategy notes. Covered by `tests/test_guardrails.py`.
+
 ## Monitoring
 
 - Health check: `GET /health`
