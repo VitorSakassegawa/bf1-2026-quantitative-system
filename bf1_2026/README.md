@@ -121,6 +121,13 @@ docker exec bf1_api python -m scripts.build_intelligence   # ELO ratings + circu
 docker exec bf1_api python -m scripts.train_model          # XGBoost position + DNF models
 ```
 
+Verify everything is ready with the smoke test (checks data, runs a sample
+strategy, confirms constraints + guardrails; exits non-zero on failure):
+
+```bash
+docker exec bf1_api python -m scripts.healthcheck
+```
+
 After the pipeline runs, the Telegram commands `/analysis`, `/simulate` and
 `/bet`, and the API `GET /api/v1/races/{id}/strategy`, return **real engine
 output** (ELO + KPIs + Monte Carlo + the trained model, all behind the
