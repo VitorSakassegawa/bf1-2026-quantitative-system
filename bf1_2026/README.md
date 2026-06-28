@@ -111,14 +111,21 @@ The containers boot with empty tables. Populate them once (and whenever you want
 to refresh history) with the pipeline scripts, run inside the API container:
 
 ```bash
-# Full pipeline: seed grid -> ingest last 5 seasons -> compute ELO + KPIs
+# Full pipeline: seed grid + 2026 calendar -> ingest history -> ELO/KPIs -> train model
 docker exec bf1_api python -m scripts.pipeline
 
 # Or run steps individually:
-docker exec bf1_api python -m scripts.seed                 # teams + current driver grid
+docker exec bf1_api python -m scripts.seed                 # teams, grid, 2026 calendar
 docker exec bf1_api python -m scripts.ingest 2021 2025     # historical results (Ergast/OpenF1)
 docker exec bf1_api python -m scripts.build_intelligence   # ELO ratings + circuit/team KPIs
+docker exec bf1_api python -m scripts.train_model          # XGBoost position + DNF models
 ```
+
+After the pipeline runs, the Telegram commands `/analysis`, `/simulate` and
+`/bet`, and the API `GET /api/v1/races/{id}/strategy`, return **real engine
+output** (ELO + KPIs + Monte Carlo + the trained model, all behind the
+guardrails). With no trained model the Monte Carlo layer still produces
+predictions, so the bot works even before `train_model` runs.
 
 All scripts are idempotent: `seed` upserts, `ingest` skips races already present,
 and `build_intelligence` recomputes ELO deterministically from scratch. The daily

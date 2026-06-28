@@ -11,12 +11,15 @@ the predictor will produce strategies for.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import AsyncSessionLocal
+from app.models.circuit import Circuit, TrackType
 from app.models.driver import Driver
+from app.models.race import Race, RaceStatus
 from app.models.team import Team
 
 # Current grid: 10 teams, 2 drivers each. Driver `code` is the stable key the
@@ -142,14 +145,101 @@ async def upsert_driver(session, team: Team, d: dict) -> Driver:
     return driver
 
 
+# 2026 calendar: (round, name, date, sprint, country, city). Circuits are linked
+# to existing historical rows by country so KPIs carry over; created otherwise.
+CALENDAR_2026: list[dict] = [
+    {"round": 1, "name": "Australian GP", "date": "2026-03-08", "sprint": False, "country": "Australia", "city": "Melbourne"},
+    {"round": 2, "name": "Chinese GP", "date": "2026-03-22", "sprint": True, "country": "China", "city": "Shanghai"},
+    {"round": 3, "name": "Japanese GP", "date": "2026-04-05", "sprint": False, "country": "Japan", "city": "Suzuka"},
+    {"round": 4, "name": "Bahrain GP", "date": "2026-04-12", "sprint": False, "country": "Bahrain", "city": "Sakhir"},
+    {"round": 5, "name": "Saudi Arabian GP", "date": "2026-04-26", "sprint": False, "country": "Saudi Arabia", "city": "Jeddah"},
+    {"round": 6, "name": "Miami GP", "date": "2026-05-03", "sprint": True, "country": "USA", "city": "Miami"},
+    {"round": 7, "name": "Canadian GP", "date": "2026-05-24", "sprint": True, "country": "Canada", "city": "Montreal"},
+    {"round": 8, "name": "Monaco GP", "date": "2026-06-07", "sprint": False, "country": "Monaco", "city": "Monte Carlo"},
+    {"round": 9, "name": "Spanish GP", "date": "2026-06-14", "sprint": False, "country": "Spain", "city": "Barcelona"},
+    {"round": 10, "name": "Austrian GP", "date": "2026-06-28", "sprint": False, "country": "Austria", "city": "Spielberg"},
+    {"round": 11, "name": "British GP", "date": "2026-07-05", "sprint": False, "country": "UK", "city": "Silverstone"},
+    {"round": 12, "name": "Belgian GP", "date": "2026-07-19", "sprint": True, "country": "Belgium", "city": "Spa"},
+    {"round": 13, "name": "Hungarian GP", "date": "2026-07-26", "sprint": False, "country": "Hungary", "city": "Budapest"},
+    {"round": 14, "name": "Dutch GP", "date": "2026-08-23", "sprint": False, "country": "Netherlands", "city": "Zandvoort"},
+    {"round": 15, "name": "Italian GP", "date": "2026-09-06", "sprint": False, "country": "Italy", "city": "Monza"},
+    {"round": 16, "name": "Spanish GP (Madrid)", "date": "2026-09-13", "sprint": False, "country": "Spain", "city": "Madrid"},
+    {"round": 17, "name": "Azerbaijan GP", "date": "2026-09-27", "sprint": False, "country": "Azerbaijan", "city": "Baku"},
+    {"round": 18, "name": "Singapore GP", "date": "2026-10-11", "sprint": True, "country": "Singapore", "city": "Singapore"},
+    {"round": 19, "name": "United States GP", "date": "2026-10-25", "sprint": False, "country": "USA", "city": "Austin"},
+    {"round": 20, "name": "Mexico City GP", "date": "2026-11-01", "sprint": False, "country": "Mexico", "city": "Mexico City"},
+    {"round": 21, "name": "Brazilian GP", "date": "2026-11-08", "sprint": False, "country": "Brazil", "city": "Sao Paulo"},
+    {"round": 22, "name": "Las Vegas GP", "date": "2026-11-21", "sprint": False, "country": "USA", "city": "Las Vegas"},
+    {"round": 23, "name": "Qatar GP", "date": "2026-11-29", "sprint": False, "country": "Qatar", "city": "Lusail"},
+    {"round": 24, "name": "Abu Dhabi GP", "date": "2026-12-06", "sprint": False, "country": "UAE", "city": "Yas Marina"},
+]
+
+
+async def _link_circuit(session, gp: dict) -> Circuit:
+    """Reuse an existing circuit for that country, else create a new one."""
+    existing = (
+        await session.execute(
+            select(Circuit).where(func.lower(Circuit.country) == gp["country"].lower())
+        )
+    ).scalars().first()
+    if existing:
+        return existing
+    circuit = Circuit(
+        name=f"{gp['city']} Circuit",
+        country=gp["country"],
+        city=gp["city"],
+        track_type=TrackType.mixed,
+    )
+    session.add(circuit)
+    await session.flush()
+    return circuit
+
+
+async def seed_calendar(session, season: int = 2026) -> int:
+    """Create the season's races (idempotent by season+round)."""
+    created = 0
+    for gp in CALENDAR_2026:
+        exists = (
+            await session.execute(
+                select(Race.id).where(
+                    Race.season == season, Race.round_number == gp["round"]
+                )
+            )
+        ).scalar_one_or_none()
+        if exists:
+            continue
+        circuit = await _link_circuit(session, gp)
+        race_date = datetime.strptime(gp["date"], "%Y-%m-%d").replace(
+            hour=14, tzinfo=timezone.utc
+        )
+        session.add(
+            Race(
+                circuit_id=circuit.id,
+                season=season,
+                round_number=gp["round"],
+                race_name=gp["name"],
+                race_date=race_date,
+                is_sprint_weekend=gp["sprint"],
+                status=RaceStatus.scheduled,
+                deadline_bets=race_date - timedelta(hours=1),
+            )
+        )
+        created += 1
+    return created
+
+
 async def seed() -> None:
     async with AsyncSessionLocal() as session:
         for entry in GRID:
             team = await upsert_team(session, entry["team"], entry["full_name"])
             for d in entry["drivers"]:
                 await upsert_driver(session, team, d)
+        created = await seed_calendar(session)
         await session.commit()
-    logger.info(f"Seed complete: {len(GRID)} teams, {len(GRID) * 2} drivers")
+    logger.info(
+        f"Seed complete: {len(GRID)} teams, {len(GRID) * 2} drivers, "
+        f"{created} new 2026 races"
+    )
 
 
 if __name__ == "__main__":

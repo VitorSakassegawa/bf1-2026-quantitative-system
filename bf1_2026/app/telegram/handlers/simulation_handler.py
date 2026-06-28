@@ -1,67 +1,90 @@
-"""Simulation handler – run Monte Carlo and display results."""
+"""Simulation handler – real Monte Carlo results from the engine."""
 
 from __future__ import annotations
 
-import time
+import uuid
 
 from loguru import logger
+from sqlalchemy import select
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from app.database import AsyncSessionLocal
+from app.models.race import Race
+from app.services.strategy_service import build_strategy, get_next_or_latest_race
 from app.telegram.formatters import escape_md
+
+BOT_SIMULATIONS = 8000
 
 
 async def simulate_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle /simulate [race_id] – run Monte Carlo simulation."""
+    """Handle /simulate [race_id] – run Monte Carlo and show the distribution."""
     if update.effective_message is None:
         return
 
     logger.info(f"/simulate from {update.effective_user}")
+    args = context.args or []
 
-    await update.effective_message.reply_text("Running 20,000 simulations...")
+    await update.effective_message.reply_text(
+        f"Running {BOT_SIMULATIONS:,} simulations…"
+    )
 
-    start = time.time()
+    async with AsyncSessionLocal() as session:
+        race = None
+        if args:
+            try:
+                race = (
+                    await session.execute(
+                        select(Race).where(Race.id == uuid.UUID(args[0]))
+                    )
+                ).scalar_one_or_none()
+            except (ValueError, TypeError):
+                race = None
+        if race is None:
+            race = await get_next_or_latest_race(session)
+        if race is None:
+            await update.effective_message.reply_text(
+                "No races yet. Run: docker exec bf1_api python -m scripts.pipeline"
+            )
+            return
 
-    # Placeholder simulation results (in production, call MonteCarloSimulator)
-    sim_results = {
-        "VER": {"avg_pos": 2.1, "top3": 0.72, "win": 0.35},
-        "NOR": {"avg_pos": 3.4, "top3": 0.58, "win": 0.22},
-        "LEC": {"avg_pos": 3.8, "top3": 0.51, "win": 0.18},
-        "HAM": {"avg_pos": 5.2, "top3": 0.32, "win": 0.08},
-        "PIA": {"avg_pos": 5.5, "top3": 0.28, "win": 0.07},
-    }
+        strategy = await build_strategy(
+            session, race, n_simulations=BOT_SIMULATIONS
+        )
 
-    elapsed = time.time() - start
+    details = sorted(
+        strategy.get("driver_details", []),
+        key=lambda d: d.get("expected_position", 20),
+    )
+    race_info = strategy.get("race", {})
+    pit = strategy.get("pit_stop_projection", {})
 
     lines = [
         "━━━━━━━━━━━━━━━━━",
-        "MONTE CARLO SIMULATION",
-        f"20,000 simulations \\| {elapsed:.1f}s",
+        "🎲 *MONTE CARLO*",
+        f"{escape_md(race_info.get('name', 'Race'))} \\| {BOT_SIMULATIONS:,} sims",
         "━━━━━━━━━━━━━━━━━",
         "",
-        "*Most Likely Winners:*",
+        "*Predicted finishing order \\(top 10\\):*",
     ]
-
-    for code, data in sorted(
-        sim_results.items(), key=lambda x: x[1]["win"], reverse=True
-    ):
-        bar_len = int(data["win"] * 40)
-        bar = "█" * bar_len + "░" * (40 - bar_len)
+    for i, d in enumerate(details[:10], 1):
+        top3 = d.get("top3_probability", 0)
+        bar_len = int(top3 * 20)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
         lines.append(
-            f"`{escape_md(code)}: {bar} {data['win']:.0%}`"
+            f"`{i:>2} {escape_md(d.get('driver_code', '???')):<3} "
+            f"{bar} {top3:.0%}`"
         )
 
-    lines.append("")
-    lines.append("*Average Positions:*")
-    for code, data in sorted(
-        sim_results.items(), key=lambda x: x[1]["avg_pos"]
-    ):
+    if pit:
+        lines.append("")
         lines.append(
-            f"  {escape_md(code)}: P{data['avg_pos']:.1f} "
-            f"\\(Top3: {data['top3']:.0%}\\)"
+            f"🛞 Pit strategy: *{escape_md(pit.get('label', 'n/a'))}*"
         )
+        if pit.get("capped"):
+            lines.append("_\\(degradation signal capped to realistic range\\)_")
 
     await update.effective_message.reply_text(
         "\n".join(lines), parse_mode="MarkdownV2"

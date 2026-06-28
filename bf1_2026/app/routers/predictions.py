@@ -54,11 +54,24 @@ async def run_simulation(
 
     n_sims = sim_req.n_simulations if sim_req else 20000
 
-    # Placeholder – in production, call MonteCarloSimulator
+    from app.services.strategy_service import build_strategy
+
+    strategy = await build_strategy(db, race, n_simulations=n_sims)
+    driver_results = {
+        d["driver_code"]: {
+            "expected_position": d["expected_position"],
+            "top3_probability": d["top3_probability"],
+            "top10_probability": d["top10_probability"],
+            "dnf_probability": d["dnf_probability"],
+            "tokens": d["tokens"],
+            "expected_value": d["expected_value"],
+        }
+        for d in strategy.get("driver_details", [])
+    }
     return SimulationResponse(
         race_id=race.id,
         n_simulations=n_sims,
-        model_version="placeholder",
-        driver_results={},
+        model_version="monte_carlo+xgboost",
+        driver_results=driver_results,
         run_at=datetime.now(timezone.utc),
     )

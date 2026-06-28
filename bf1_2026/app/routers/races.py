@@ -69,21 +69,18 @@ async def create_race(
 @router.get("/{race_id}/analysis")
 async def get_race_analysis(
     race_id: uuid.UUID,
+    aggressiveness: str = "balanced",
     db: AsyncSession = Depends(get_db),
 ):
-    """Get complete analysis for a race."""
+    """Get complete data-driven analysis for a race."""
     result = await db.execute(select(Race).where(Race.id == race_id))
     race = result.scalar_one_or_none()
     if race is None:
         raise HTTPException(status_code=404, detail="Race not found")
 
-    # Placeholder – in production, call StrategyEngine
-    return {
-        "race_id": str(race.id),
-        "race_name": race.race_name,
-        "status": race.status.value,
-        "analysis": "Run /api/v1/races/{race_id}/strategy for full analysis",
-    }
+    from app.services.strategy_service import build_strategy
+
+    return await build_strategy(db, race, aggressiveness)
 
 
 @router.get("/{race_id}/strategy")
@@ -92,16 +89,12 @@ async def get_race_strategy(
     aggressiveness: str = "balanced",
     db: AsyncSession = Depends(get_db),
 ):
-    """Get optimal strategy for a race."""
+    """Get the optimal token strategy for a race (full engine pipeline)."""
     result = await db.execute(select(Race).where(Race.id == race_id))
     race = result.scalar_one_or_none()
     if race is None:
         raise HTTPException(status_code=404, detail="Race not found")
 
-    # Placeholder – in production, call StrategyEngine.generate_strategy()
-    return {
-        "race_id": str(race.id),
-        "race_name": race.race_name,
-        "aggressiveness": aggressiveness,
-        "strategy": "Strategy generation requires data collection first",
-    }
+    from app.services.strategy_service import build_strategy
+
+    return await build_strategy(db, race, aggressiveness)
