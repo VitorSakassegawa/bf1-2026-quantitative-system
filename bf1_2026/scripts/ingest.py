@@ -128,6 +128,13 @@ async def ingest_season(collector: F1ApiFallback, season: int) -> None:
             session.add(race_row)
             await session.flush()
 
+            # --- Pit stop counts (per driver, matched by Ergast driverId) ---
+            pit_counts: dict[str, int] = {}
+            for p in await collector.fetch_pit_stops(season, rnd):
+                ref = p.get("driver", "")
+                if ref:
+                    pit_counts[ref] = pit_counts.get(ref, 0) + 1
+
             # --- Race results ---
             results = await collector.fetch_race_results(season, rnd)
             for r in results:
@@ -148,6 +155,7 @@ async def ingest_season(collector: F1ApiFallback, season: int) -> None:
                         dnf=r.get("dnf", False),
                         dnf_reason=r.get("dnf_reason"),
                         laps_completed=r.get("laps", 0),
+                        pit_stops=pit_counts.get(r.get("driver_ref", ""), 0),
                     )
                 )
 

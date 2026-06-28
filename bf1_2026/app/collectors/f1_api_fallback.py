@@ -170,6 +170,7 @@ class F1ApiFallback:
                         "position": position,
                         "driver": f"{driver.get('givenName', '')} {driver.get('familyName', '')}",
                         "driver_code": driver.get("code", ""),
+                        "driver_ref": driver.get("driverId", ""),
                         "team": constructor.get("name", ""),
                         "grid": int(r.get("grid", 0)),
                         "laps": int(r.get("laps", 0)),
