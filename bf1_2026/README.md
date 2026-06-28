@@ -105,6 +105,25 @@ cp .env.template .env
 docker compose up -d
 ```
 
+## First-Run Data Pipeline
+
+The containers boot with empty tables. Populate them once (and whenever you want
+to refresh history) with the pipeline scripts, run inside the API container:
+
+```bash
+# Full pipeline: seed grid -> ingest last 5 seasons -> compute ELO + KPIs
+docker exec bf1_api python -m scripts.pipeline
+
+# Or run steps individually:
+docker exec bf1_api python -m scripts.seed                 # teams + current driver grid
+docker exec bf1_api python -m scripts.ingest 2021 2025     # historical results (Ergast/OpenF1)
+docker exec bf1_api python -m scripts.build_intelligence   # ELO ratings + circuit/team KPIs
+```
+
+All scripts are idempotent: `seed` upserts, `ingest` skips races already present,
+and `build_intelligence` recomputes ELO deterministically from scratch. The daily
+scheduler keeps data fresh after this initial load.
+
 ## Telegram Bot Commands
 
 | Command | Description |
