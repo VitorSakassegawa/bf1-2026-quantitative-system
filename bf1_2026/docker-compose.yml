@@ -85,8 +85,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-bf1user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-bf1_2026}
-    ports:
-      - "5432:5432"
+    # Internal-only: reachable by other services via host "postgres".
+    # Add a "ports" mapping here only if you need external DB access.
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -108,8 +108,7 @@ services:
     image: redis:7-alpine
     container_name: bf1_redis
     command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
+    # Internal-only: reachable by other services via host "redis".
     volumes:
       - redis_data:/data
     networks:
@@ -121,9 +120,13 @@ services:
       timeout: 5s
       retries: 5
 
+  # Optional reverse proxy. NOT started by default (it would clash with DSM's
+  # own 80/443 on Synology, and the Telegram bot uses polling so no inbound
+  # port is needed). Enable explicitly with: docker compose --profile proxy up -d
   nginx:
     image: nginx:alpine
     container_name: bf1_nginx
+    profiles: ["proxy"]
     ports:
       - "80:80"
       - "443:443"

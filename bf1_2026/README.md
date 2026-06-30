@@ -105,6 +105,41 @@ cp .env.template .env
 docker compose up -d
 ```
 
+## Deploy on Synology NAS (Container Manager)
+
+Tested target: DS220+ (Celeron J4025, x86-64), DSM 7.2+, 6 GB+ RAM. The bot
+uses Telegram polling, so no inbound ports / port-forwarding are needed. `nginx`
+is disabled by default (it would clash with DSM's 80/443) and Postgres/Redis are
+internal-only.
+
+1. **Enable SSH** — Control Panel → Terminal & SNMP → Enable SSH service.
+2. **Copy the project** to a shared folder, e.g. `/volume1/docker/bf1_2026`
+   (File Station upload, or `git clone` if you have the Git CLI).
+3. **Create `.env`** from the template and fill in the real values
+   (`TELEGRAM_BOT_TOKEN`, `OPENWEATHER_API_KEY`, `POSTGRES_PASSWORD`, and a
+   matching password inside `DATABASE_URL`; set `SECRET_KEY`).
+4. **Build & start** over SSH (first build is slow on the Celeron — XGBoost/PyMC
+   wheels take ~15–40 min):
+
+   ```bash
+   cd /volume1/docker/bf1_2026
+   sudo docker compose up -d --build        # nginx is skipped automatically
+   sudo docker compose ps                    # all services "healthy"
+   ```
+
+   Or via the **Container Manager GUI**: Project → Create → point it at the
+   folder (it auto-detects `docker-compose.yml`) → Build.
+5. **Populate + verify**:
+
+   ```bash
+   sudo docker exec bf1_api python -m scripts.pipeline
+   sudo docker exec bf1_api python -m scripts.healthcheck
+   ```
+6. Message your bot `/start` on Telegram.
+
+To later run the optional reverse proxy on non-DSM ports, start it with
+`docker compose --profile proxy up -d` after editing `deploy/nginx.conf`.
+
 ## First-Run Data Pipeline
 
 The containers boot with empty tables. Populate them once (and whenever you want
