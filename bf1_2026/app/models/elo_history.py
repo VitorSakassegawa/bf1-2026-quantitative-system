@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,6 +18,15 @@ class EntityType(str, enum.Enum):
 
 class ELOHistory(Base):
     __tablename__ = "elo_history"
+
+    __table_args__ = (
+        # compute_elo deletes and reinserts history; without this a partial
+        # failure leaves duplicate rows behind.
+        UniqueConstraint(
+            "entity_type", "entity_id", "race_id", name="uq_elo_history_entity_race"
+        ),
+        Index("ix_elo_history_race_id", "race_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.utils.security import require_write_key
 from app.models.driver import Driver
 from app.schemas.driver import DriverCreate, DriverKPIs, DriverResponse
 
@@ -42,7 +43,12 @@ async def get_driver(
     return driver
 
 
-@router.post("/", response_model=DriverResponse, status_code=201)
+@router.post(
+    "/",
+    response_model=DriverResponse,
+    status_code=201,
+    dependencies=[Depends(require_write_key)],
+)
 async def create_driver(
     driver_in: DriverCreate,
     db: AsyncSession = Depends(get_db),

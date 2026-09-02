@@ -30,6 +30,13 @@ from app.models.elo_history import ELOHistory, EntityType
 from app.models.race import Race
 from app.models.race_result import RaceResult
 from app.models.team import Team
+from app.utils.season_window import (
+    ERA_ELO_REGRESSION,
+    MIN_ROWS_FOR_ERA_ONLY,
+    crosses_era_boundary,
+    regress_elo_for_new_era,
+    seasons_in_scope,
+)
 
 
 async def compute_elo() -> None:
@@ -51,7 +58,25 @@ async def compute_elo() -> None:
             await session.execute(select(Race).order_by(Race.race_date))
         ).scalars().all()
 
+        previous_season: int | None = None
         for race in races:
+            # At a regulation boundary the competitive order resets, so carrying
+            # ratings straight across imports the previous era's pecking order
+            # into a season where it no longer holds. Regress toward the
+            # baseline instead: driver skill carries over, machinery does not.
+            if previous_season is not None and crosses_era_boundary(
+                previous_season, race.season
+            ):
+                for did in elos:
+                    elos[did] = regress_elo_for_new_era(
+                        elos[did], ELOEngine.BASE_ELO
+                    )
+                logger.info(
+                    f"{race.season}: regulation era boundary — regressed ELO "
+                    f"{ERA_ELO_REGRESSION:.0%} toward {ELOEngine.BASE_ELO:.0f}"
+                )
+            previous_season = race.season
+
             results = (
                 await session.execute(
                     select(RaceResult).where(RaceResult.race_id == race.id)
@@ -102,15 +127,40 @@ async def compute_circuit_kpis() -> None:
                     select(Race).where(Race.circuit_id == circuit.id)
                 )
             ).scalars().all()
-            race_ids = [r.id for r in races]
-            if not race_ids:
+            if not races:
                 continue
 
-            results = (
+            # Restrict to the current regulation era where there is enough of
+            # it, else the recency window. Pooling every season ever recorded
+            # made "5-year" KPIs span the 2022 ground-effect change and the
+            # 2026 reset, so a circuit's overtaking index described a car that
+            # no longer exists.
+            season_of_race = {r.id: r.season for r in races}
+            rows_per_season: dict[int, int] = {}
+            all_results = (
                 await session.execute(
-                    select(RaceResult).where(RaceResult.race_id.in_(race_ids))
+                    select(RaceResult).where(
+                        RaceResult.race_id.in_([r.id for r in races])
+                    )
                 )
             ).scalars().all()
+            if not all_results:
+                continue
+            for r in all_results:
+                s = season_of_race.get(r.race_id)
+                if s is not None:
+                    rows_per_season[s] = rows_per_season.get(s, 0) + 1
+
+            scope = set(
+                seasons_in_scope(
+                    sorted(rows_per_season),
+                    min_rows=MIN_ROWS_FOR_ERA_ONLY,
+                    rows_per_season=rows_per_season,
+                )
+            )
+            results = [
+                r for r in all_results if season_of_race.get(r.race_id) in scope
+            ]
             if not results:
                 continue
 

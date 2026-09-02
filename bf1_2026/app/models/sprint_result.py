@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,6 +12,12 @@ from app.database import Base
 
 class SprintResult(Base):
     __tablename__ = "sprint_results"
+
+    __table_args__ = (
+        UniqueConstraint("race_id", "driver_id", name="uq_sprint_results_race_driver"),
+        Index("ix_sprint_results_race_id", "race_id"),
+        Index("ix_sprint_results_driver_id", "driver_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

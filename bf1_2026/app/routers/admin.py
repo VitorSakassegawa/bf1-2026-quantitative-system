@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,17 +12,21 @@ from app.models.bet import Bet
 from app.models.driver import Driver
 from app.models.race import Race
 from app.models.user import User
+from app.utils.security import require_admin_key
 
-router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+# Guard the whole router rather than each route, so a new admin endpoint is
+# protected by default instead of by remembering to add the dependency.
+router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin_key)],
+)
+
+# Kept as an alias so existing imports of `verify_admin` keep working.
+verify_admin = require_admin_key
 
 
-async def verify_admin(x_admin_key: str = Header(default="")) -> None:
-    """Simple admin key verification via header."""
-    if x_admin_key != settings.secret_key:
-        raise HTTPException(status_code=403, detail="Invalid admin key")
-
-
-@router.get("/dashboard", dependencies=[Depends(verify_admin)])
+@router.get("/dashboard")
 async def admin_dashboard(db: AsyncSession = Depends(get_db)):
     """Admin dashboard – system overview."""
     users_count = await db.scalar(select(func.count()).select_from(User))
@@ -41,21 +45,21 @@ async def admin_dashboard(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/recalculate-elo", dependencies=[Depends(verify_admin)])
+@router.post("/recalculate-elo")
 async def recalculate_elo(db: AsyncSession = Depends(get_db)):
     """Trigger a full ELO recalculation for all drivers and teams."""
     # In production: recalculate all ELO ratings from historical data
     return {"status": "ELO recalculation triggered"}
 
 
-@router.post("/retrain-model", dependencies=[Depends(verify_admin)])
+@router.post("/retrain-model")
 async def retrain_model(db: AsyncSession = Depends(get_db)):
     """Trigger a full model retrain."""
     # In production: trigger XGBoost full retrain
     return {"status": "Model retrain triggered"}
 
 
-@router.post("/update-data", dependencies=[Depends(verify_admin)])
+@router.post("/update-data")
 async def update_data(db: AsyncSession = Depends(get_db)):
     """Trigger a manual data update from F1 sources."""
     # In production: run collector pipeline

@@ -17,6 +17,12 @@ class WeatherCollector:
 
     BASE_URL = "https://api.openweathermap.org/data/3.0/onecall"
 
+    # An hourly sample more than this far from race time is not a forecast of
+    # the race; fall through to the daily series instead.
+    MAX_HOURLY_GAP_SECONDS = 3 * 3600
+    # And a daily entry beyond this is not usable at all.
+    MAX_DAILY_GAP_SECONDS = 36 * 3600
+
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
 
@@ -51,7 +57,14 @@ class WeatherCollector:
                 {"lat": lat, "lon": lon, "exclude": "minutely,alerts"}
             )
 
-            # Try to find the hourly forecast closest to race time
+            # Find the forecast closest to race time.
+            #
+            # One Call 3.0 returns 48 hours of `hourly` and 8 days of `daily`.
+            # The hourly scan used to accept whatever was nearest with no limit
+            # on the distance, and because `best_hour` was then non-None the
+            # daily fallback below could never run. Asking about a race six
+            # days out therefore returned an hourly sample ~4.5 days away and
+            # reported it as the race forecast.
             target_ts = race_date.timestamp()
             best_hour = None
             best_diff = float("inf")
@@ -62,13 +75,29 @@ class WeatherCollector:
                     best_diff = diff
                     best_hour = hour
 
-            if best_hour is None:
-                # Fall back to daily
+            if best_hour is None or best_diff > self.MAX_HOURLY_GAP_SECONDS:
+                # Outside the hourly range — use the daily forecast instead.
+                best_day = None
+                best_day_diff = float("inf")
                 for day in data.get("daily", []):
                     diff = abs(day["dt"] - target_ts)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_hour = day
+                    if diff < best_day_diff:
+                        best_day_diff = diff
+                        best_day = day
+
+                if best_day is not None and best_day_diff <= self.MAX_DAILY_GAP_SECONDS:
+                    logger.debug(
+                        f"Race is {best_diff / 3600:.1f}h beyond the hourly "
+                        f"forecast; using the daily entry "
+                        f"({best_day_diff / 3600:.1f}h away)"
+                    )
+                    best_hour, best_diff = best_day, best_day_diff
+                elif best_hour is not None:
+                    logger.warning(
+                        f"Nearest forecast is {best_diff / 3600:.1f}h from race "
+                        "time — too far to be meaningful"
+                    )
+                    return self._empty_weather()
 
             if best_hour is None:
                 logger.warning("No forecast data found for race date")

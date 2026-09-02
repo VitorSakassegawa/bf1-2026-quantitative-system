@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -20,6 +20,14 @@ class RaceStatus(str, enum.Enum):
 
 class Race(Base):
     __tablename__ = "races"
+
+    __table_args__ = (
+        # A season/round pair identifies a Grand Prix. Both ingest.py and
+        # seed.py rely on this being unique but nothing enforced it.
+        UniqueConstraint("season", "round_number", name="uq_races_season_round"),
+        Index("ix_races_circuit_id", "circuit_id"),
+        Index("ix_races_season_round", "season", "round_number"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

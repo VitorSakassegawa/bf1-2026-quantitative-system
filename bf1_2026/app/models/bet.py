@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, Integer, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -27,6 +27,13 @@ class BetStatus(str, enum.Enum):
 
 class Bet(Base):
     __tablename__ = "bets"
+
+    __table_args__ = (
+        # One standing bet per user per race.
+        UniqueConstraint("user_id", "race_id", name="uq_bets_user_race"),
+        Index("ix_bets_user_id", "user_id"),
+        Index("ix_bets_race_id", "race_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

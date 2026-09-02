@@ -17,6 +17,10 @@ from app.utils.guardrails import (
 from app.utils.validators import BF1_POINTS_TABLE, BF1_DNF_PENALTY
 
 
+# The rating every driver starts from; matches ELOEngine.BASE_ELO.
+ELO_BASELINE = 1500.0
+
+
 @dataclass
 class SimulationConfig:
     n_simulations: int = 20000
@@ -24,6 +28,11 @@ class SimulationConfig:
     safety_car_probability: float = 0.35
     safety_car_position_variance: float = 2.0
     grid_noise_sigma: float = 1.5
+    # ELO points worth one position of race pace. With K=32 per race the
+    # ratings spread a few hundred points across a field, so 100 puts a strong
+    # driver roughly 1.5-2 positions ahead of a weak one on equal machinery —
+    # visible against grid_noise_sigma without overwhelming the starting grid.
+    elo_points_per_position: float = 100.0
 
 
 class MonteCarloSimulator:
@@ -176,9 +185,21 @@ class MonteCarloSimulator:
             wet_bonus = -wet_perf * weather_risk * 2  # Lower score = better
             scores += weather_noise + wet_bonus
 
-        # 3) ELO adjustment (better ELO → lower score)
-        elo_factor = -(elo_arr - 1500) / 400.0
-        scores += elo_factor * 0.5
+        # 3) ELO adjustment (better ELO → lower score → better finish).
+        #
+        # Scores are in grid-position units, so this term has to be expressed
+        # in positions too. The old form, -(elo-1500)/400 * 0.5, worked out to
+        # 0.00125 positions per ELO point: across a realistic 150-point spread
+        # that is ±0.19 positions against ~2.5 of combined noise. Inverting
+        # every rating on the grid moved the simulated result by 0.02 places,
+        # i.e. the rating system had no measurable effect on the output and the
+        # simulator was a pure function of the starting grid.
+        #
+        # ELO_POINTS_PER_POSITION says how much rating advantage is worth one
+        # position of race pace. The grid already encodes qualifying pace, so
+        # this term only carries what ELO actually measures: race craft.
+        elo_factor = -(elo_arr - ELO_BASELINE) / config.elo_points_per_position
+        scores += elo_factor
 
         # 4) DNF check (Bernoulli per driver)
         dnfs = rng.random(n) < dnf_probs

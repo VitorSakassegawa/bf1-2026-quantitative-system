@@ -9,8 +9,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from app.config import settings
+from app.config import Environment, settings
 from app.routers import admin, bets, drivers, predictions, races
+from app.utils.security import startup_security_report
 
 
 @asynccontextmanager
@@ -18,17 +19,45 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("BF1-2026 Quantitative System starting up")
 
-    # Ensure database tables exist. For schema migrations in production,
-    # prefer `alembic upgrade head`; this create_all is idempotent and makes
-    # a fresh deploy boot without a manual migration step.
-    try:
-        import app.models  # noqa: F401  (register all ORM models on Base)
-        from app.database import init_db
+    # Say plainly, at boot, what is not configured — rather than letting it be
+    # discovered by whoever finds the open endpoint first.
+    for problem in startup_security_report():
+        logger.warning(f"SECURITY: {problem}")
 
-        await init_db()
-        logger.info("Database tables ensured")
-    except Exception as e:
-        logger.warning(f"Database init skipped/failed: {e}")
+    # Schema is owned by Alembic (`alembic upgrade head`). create_all is only
+    # a convenience for local development — running it in production would
+    # build a schema Alembic then thinks it has never migrated.
+    #
+    # The old version wrapped this in `except Exception: logger.warning(...)`,
+    # so a database that was unreachable or had no tables produced one warning
+    # and a fully "healthy" app in which every request then failed.
+    import app.models  # noqa: F401  (register all ORM models on Base)
+
+    if settings.environment == Environment.development:
+        try:
+            from app.database import init_db
+
+            await init_db()
+            logger.info("Database tables ensured (development create_all)")
+        except Exception as e:
+            logger.error(f"Database init failed: {e}")
+    else:
+        try:
+            from sqlalchemy import text
+
+            from app.database import engine
+
+            async with engine.connect() as conn:
+                revision = (
+                    await conn.execute(text("SELECT version_num FROM alembic_version"))
+                ).scalar_one_or_none()
+            logger.info(f"Database reachable, schema at revision {revision}")
+        except Exception as e:
+            logger.error(
+                f"Database schema check failed: {e}. "
+                "Run `alembic upgrade head` — the API cannot serve data until "
+                "the schema exists."
+            )
 
     # The scheduler runs in its own container (`python -m app.scheduler.run`,
     # the bf1_scheduler service). Starting it here as well made every job fire
@@ -59,19 +88,37 @@ async def lifespan(app: FastAPI):
     logger.info("BF1-2026 Quantitative System shut down")
 
 
+# Swagger/ReDoc publish the whole API surface — including /api/v1/admin/* — to
+# anonymous visitors, so they are off unless explicitly enabled or running in
+# development. Passing None to these arguments unregisters the routes.
+_docs_on = settings.enable_docs or settings.environment == Environment.development
+
 app = FastAPI(
     title="BF1-2026 Quantitative System",
     version="1.0.0",
     description="Quantitative predictive analysis engine for BF1-2026",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
 )
 
-# CORS
-origins = settings.allowed_origins.split(",")
+# CORS. Entries are stripped because "a.com, b.com" otherwise yields a second
+# origin with a leading space that can never match. A wildcard combined with
+# allow_credentials makes Starlette echo back any requesting origin, so the two
+# are mutually exclusive: an explicit list gets credentials, "*" does not.
+origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+allow_credentials = origins != ["*"]
+if not allow_credentials:
+    logger.warning(
+        "ALLOWED_ORIGINS is '*' — disabling credentialed CORS. Set an explicit "
+        "origin list to allow cookies or Authorization from a browser."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins or ["*"],
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, Integer, String
+from sqlalchemy import DateTime, Enum, Float, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,12 @@ class TrackType(str, enum.Enum):
 
 class Circuit(Base):
     __tablename__ = "circuits"
+
+    __table_args__ = (
+        # ingest.py calls scalar_one_or_none() on a name lookup, which raises
+        # MultipleResultsFound the moment two circuits share a name.
+        UniqueConstraint("name", name="uq_circuits_name"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

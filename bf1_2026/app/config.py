@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     allowed_origins: str = Field(default="*")
 
+    # API authentication. Kept separate from secret_key so a token handed to an
+    # integration cannot also trigger admin operations, and so an unset value
+    # fails closed instead of falling back to a default published in this repo.
+    write_api_key: str = Field(default="")
+    admin_api_key: str = Field(default="")
+
+    # Expose /docs, /redoc and /openapi.json. Off outside development: the
+    # schema advertises the admin surface to anonymous visitors.
+    enable_docs: bool = Field(default=False)
+
     # ML
     models_storage_path: str = Field(default="/app/models_storage")
     monte_carlo_simulations: int = Field(default=20000)

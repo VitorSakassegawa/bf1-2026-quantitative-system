@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,23 +10,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.bet import Bet, BetStatus
+from app.models.driver import Driver
 from app.models.race import Race
+from app.models.user import User
 from app.schemas.bet import BetCreate, BetResponse
-from app.utils.validators import is_bet_deadline_passed
+from app.utils.security import require_write_key
+from app.utils.validators import is_bet_deadline_passed, validate_allocation
 
 router = APIRouter(prefix="/api/v1/bets", tags=["bets"])
 
 
-@router.post("/", response_model=BetResponse, status_code=201)
+@router.post(
+    "/",
+    response_model=BetResponse,
+    status_code=201,
+    dependencies=[Depends(require_write_key)],
+)
 async def create_bet(
     bet_in: BetCreate,
-    telegram_id: int | None = None,
+    telegram_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """Register a new bet (token allocation)."""
-    # Check race exists and deadline hasn't passed
-    result = await db.execute(select(Race).where(Race.id == bet_in.race_id))
-    race = result.scalar_one_or_none()
+    """Register a new bet (token allocation) for a Telegram user.
+
+    `telegram_id` is required: the bet has to belong to a real user row. This
+    previously generated a random UUID as a placeholder, which could only ever
+    raise a foreign-key violation, so the endpoint had never succeeded.
+    """
+    user = (
+        await db.execute(select(User).where(User.telegram_id == telegram_id))
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(
+            status_code=404, detail=f"No user registered for telegram_id {telegram_id}"
+        )
+
+    race = (
+        await db.execute(select(Race).where(Race.id == bet_in.race_id))
+    ).scalar_one_or_none()
     if race is None:
         raise HTTPException(status_code=404, detail="Race not found")
 
@@ -37,12 +57,32 @@ async def create_bet(
             detail="Betting deadline has passed (1h before race)",
         )
 
-    # In production: look up user by telegram_id, validate team diversity
+    # Enforce the BF1 rules here too. The optimizer produces valid allocations,
+    # but this endpoint accepts hand-built ones.
+    allocations = bet_in.allocations or {}
+    driver_ids = list(allocations.keys())
+    rows = (
+        await db.execute(
+            select(Driver.id, Driver.team_id).where(Driver.id.in_(driver_ids))
+        )
+    ).all()
+    if len(rows) != len(driver_ids):
+        raise HTTPException(
+            status_code=422, detail="Allocation references unknown driver ids"
+        )
+
+    team_membership = {str(did): str(tid) for did, tid in rows}
+    errors = validate_allocation(
+        {str(k): v for k, v in allocations.items()}, team_membership
+    )
+    if errors:
+        raise HTTPException(status_code=422, detail={"constraint_errors": errors})
+
     bet = Bet(
-        user_id=uuid.uuid4(),  # placeholder
+        user_id=user.id,
         race_id=bet_in.race_id,
         strategy_type=bet_in.strategy_type,
-        allocations=bet_in.allocations,
+        allocations=allocations,
         confirmed_at=datetime.now(timezone.utc),
         status=BetStatus.confirmed,
     )

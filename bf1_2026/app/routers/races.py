@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.utils.security import require_write_key
 from app.models.race import Race
 from app.schemas.race import RaceAnalysis, RaceCreate, RaceResponse
 
@@ -41,7 +42,12 @@ async def get_race(
     return race
 
 
-@router.post("/", response_model=RaceResponse, status_code=201)
+@router.post(
+    "/",
+    response_model=RaceResponse,
+    status_code=201,
+    dependencies=[Depends(require_write_key)],
+)
 async def create_race(
     race_in: RaceCreate,
     db: AsyncSession = Depends(get_db),

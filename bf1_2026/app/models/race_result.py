@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,6 +12,18 @@ from app.database import Base
 
 class RaceResult(Base):
     __tablename__ = "race_results"
+
+    __table_args__ = (
+        # One result per driver per race. Idempotency in scripts/ingest.py was
+        # a SELECT-then-INSERT with nothing behind it, so a concurrent or
+        # interrupted run could duplicate a whole race.
+        UniqueConstraint("race_id", "driver_id", name="uq_race_results_race_driver"),
+        # Postgres does not index foreign keys automatically. These two are the
+        # hot paths: build_intelligence scans by race, and strategy_service
+        # queries by driver once per driver on every strategy request.
+        Index("ix_race_results_race_id", "race_id"),
+        Index("ix_race_results_driver_id", "driver_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

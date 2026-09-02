@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.utils.security import require_write_key
 from app.models.prediction import Prediction
 from app.models.race import Race
 from app.schemas.prediction import (
@@ -40,7 +41,11 @@ async def get_predictions(
     return predictions
 
 
-@router.post("/race/{race_id}/simulate", response_model=SimulationResponse)
+@router.post(
+    "/race/{race_id}/simulate",
+    response_model=SimulationResponse,
+    dependencies=[Depends(require_write_key)],
+)
 async def run_simulation(
     race_id: uuid.UUID,
     sim_req: SimulationRequest | None = None,

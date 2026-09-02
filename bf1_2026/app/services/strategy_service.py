@@ -8,8 +8,10 @@ if a trained model is absent the Monte Carlo layer still produces predictions.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 
 import pandas as pd
 from loguru import logger
@@ -28,6 +30,13 @@ from app.models.team import Team
 from app.models.weather import Weather
 from app.optimizer.strategy_engine import StrategyEngine
 from app.utils.guardrails import clamp_probability
+from app.utils.season_window import MIN_ROWS_FOR_ERA_ONLY, seasons_in_scope
+
+# Bounds on a caller-supplied simulation count. The upper bound keeps a single
+# request from occupying a CPU indefinitely; the lower one keeps the estimates
+# from being pure noise.
+MIN_SIMULATIONS = 500
+MAX_SIMULATIONS = 50_000
 
 _circuit_calc = CircuitKPICalculator()
 _driver_calc = DriverKPICalculator()
@@ -83,19 +92,39 @@ async def _circuit_kpis(session: AsyncSession, circuit: Circuit | None) -> dict:
     if circuit is None:
         return kpis
 
-    race_ids = [
-        r for (r,) in (
-            await session.execute(select(Race.id).where(Race.circuit_id == circuit.id))
+    season_of_race = {
+        rid: season
+        for rid, season in (
+            await session.execute(
+                select(Race.id, Race.season).where(Race.circuit_id == circuit.id)
+            )
         ).all()
-    ]
-    if not race_ids:
+    }
+    if not season_of_race:
         return kpis
 
-    results = (
+    all_results = (
         await session.execute(
-            select(RaceResult).where(RaceResult.race_id.in_(race_ids))
+            select(RaceResult).where(RaceResult.race_id.in_(list(season_of_race)))
         )
     ).scalars().all()
+
+    # Same regulation-era scoping as the offline KPI build, so a live request
+    # and a rebuilt Circuit row agree on which seasons count.
+    rows_per_season: dict[int, int] = {}
+    for r in all_results:
+        s = season_of_race.get(r.race_id)
+        if s is not None:
+            rows_per_season[s] = rows_per_season.get(s, 0) + 1
+    scope = set(
+        seasons_in_scope(
+            sorted(rows_per_season),
+            min_rows=MIN_ROWS_FOR_ERA_ONLY,
+            rows_per_season=rows_per_season,
+        )
+    )
+    results = [r for r in all_results if season_of_race.get(r.race_id) in scope]
+
     if results:
         df = pd.DataFrame(
             [
@@ -224,24 +253,35 @@ async def build_strategy(
     except Exception as e:
         logger.info(f"No trained model loaded ({e}); using Monte Carlo only")
 
+    # Bound the request. Monte Carlo is a Python-level loop, so an unbounded
+    # n_simulations lets one caller occupy a CPU for as long as it likes.
     n_sims = n_simulations or settings.monte_carlo_simulations
-    strategy = engine.generate_strategy(
-        drivers=drivers_payload,
-        circuit_kpis=circuit_kpis,
-        weather=weather,
-        team_membership=team_membership,
-        user_aggressiveness=aggressiveness,
-        # These are two different things. `is_sprint` means "the session being
-        # predicted IS the sprint race"; `is_sprint_weekend` means "this GP is
-        # part of a weekend that also contains a sprint". This service builds a
-        # strategy for the Grand Prix, so is_sprint is always False — passing
-        # the weekend flag here doubled the GP's points and clamped the
-        # pit-stop projection to the sprint window (a 3-stop race reported as
-        # a 1-stopper).
-        is_sprint=False,
-        is_sprint_weekend=race.is_sprint_weekend,
-        n_simulations=n_sims,
-        confidence=confidence,
+    n_sims = max(MIN_SIMULATIONS, min(int(n_sims), MAX_SIMULATIONS))
+
+    # generate_strategy is CPU-bound and fully synchronous. Called inline it
+    # blocked the event loop for seconds at a time — /health could not be
+    # answered during a run, concurrent requests serialised, and in the bot
+    # process one /simulate froze every other user. Hand it to a worker thread.
+    strategy = await asyncio.to_thread(
+        partial(
+            engine.generate_strategy,
+            drivers=drivers_payload,
+            circuit_kpis=circuit_kpis,
+            weather=weather,
+            team_membership=team_membership,
+            user_aggressiveness=aggressiveness,
+            # These are two different things. `is_sprint` means "the session
+            # being predicted IS the sprint race"; `is_sprint_weekend` means
+            # "this GP is part of a weekend that also contains a sprint". This
+            # service builds a strategy for the Grand Prix, so is_sprint is
+            # always False — passing the weekend flag here doubled the GP's
+            # points and clamped the pit-stop projection to the sprint window
+            # (a 3-stop race reported as a 1-stopper).
+            is_sprint=False,
+            is_sprint_weekend=race.is_sprint_weekend,
+            n_simulations=n_sims,
+            confidence=confidence,
+        )
     )
 
     strategy["race"] = {
