@@ -36,6 +36,34 @@ treated as unconfigured: guarded routes return **503** and the reason is logged
 at boot. That is deliberate — it fails closed rather than accepting an empty
 header.
 
+### Running without API keys
+
+If the deployment is genuinely unreachable from the internet — bound to
+loopback, or behind a private network or VPN — you can turn the guards off:
+
+```bash
+REQUIRE_API_KEYS=false
+```
+
+Every write route and the whole admin surface is then open to anything that can
+reach the port, and the API says so at boot:
+
+```
+SECURITY: REQUIRE_API_KEYS=false — every write route and the entire admin
+surface is UNAUTHENTICATED. Only valid if this port is truly unreachable
+from the internet
+```
+
+**A public hostname does not qualify**, including a `*.ondigitalocean.app`
+URL — those are published to the internet by default. If the app answers on a
+public address, anyone who finds it can create races and drivers (which poisons
+the ELO grid the strategies are built from) and can pin the container's CPU
+through `/simulate`. Generating two keys takes about ten seconds and is the
+better trade unless you are certain the port is private.
+
+A correct key still wins when one is set, so you can turn this off temporarily
+without removing your keys.
+
 ---
 
 ## 2. Build and start

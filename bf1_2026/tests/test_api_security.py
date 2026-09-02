@@ -46,6 +46,7 @@ def _client(monkeypatch, **env):
         "ADMIN_API_KEY": ADMIN_KEY,
         "ALLOWED_ORIGINS": "https://example.test",
         "ENABLE_DOCS": "false",
+        "REQUIRE_API_KEYS": "true",
     }
     defaults.update(env)
     for k, v in defaults.items():
@@ -117,6 +118,48 @@ class TestFailClosed:
             "/api/v1/admin/dashboard", headers={"X-Admin-Key": placeholder}
         )
         assert resp.status_code == 503
+
+
+class TestOptOutForPrivateDeployments:
+    """REQUIRE_API_KEYS=false disables the guards entirely.
+
+    It exists for a deployment that genuinely cannot be reached from the
+    internet. It is opt-in, it is never the default, and it announces itself
+    at boot — the point is that turning auth off has to be a deliberate,
+    visible act rather than the consequence of forgetting to set a key.
+    """
+
+    def test_guards_are_bypassed_when_disabled(self, monkeypatch):
+        client = _client(
+            monkeypatch, REQUIRE_API_KEYS="false", WRITE_API_KEY="", ADMIN_API_KEY=""
+        )
+        # Not 401/503: the request reaches the endpoint, which then rejects the
+        # empty body on its own merits.
+        assert client.post("/api/v1/drivers/", json={}).status_code != 401
+        assert client.post("/api/v1/drivers/", json={}).status_code != 503
+
+    def test_default_is_secure(self, monkeypatch):
+        """Omitting the flag entirely must keep the guards on."""
+        monkeypatch.delenv("REQUIRE_API_KEYS", raising=False)
+        client = _client(monkeypatch, WRITE_API_KEY="", ADMIN_API_KEY="")
+        monkeypatch.delenv("REQUIRE_API_KEYS", raising=False)
+        assert client.post("/api/v1/races/", json={}).status_code == 503
+
+    def test_disabling_it_is_reported_at_boot(self, monkeypatch):
+        _client(monkeypatch, REQUIRE_API_KEYS="false", WRITE_API_KEY="", ADMIN_API_KEY="")
+        import app.utils.security as security
+
+        problems = " ".join(security.startup_security_report())
+        assert "REQUIRE_API_KEYS=false" in problems
+        assert "UNAUTHENTICATED" in problems
+
+    def test_valid_keys_still_win_when_present(self, monkeypatch):
+        """Turning the requirement off must not break a configured setup."""
+        client = _client(monkeypatch, REQUIRE_API_KEYS="false")
+        resp = client.get(
+            "/api/v1/admin/dashboard", headers={"X-Admin-Key": "wrong-key"}
+        )
+        assert resp.status_code == 401
 
 
 class TestPublicSurface:

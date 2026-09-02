@@ -46,16 +46,28 @@ def _configured(key: str | None) -> bool:
 
 
 def _is_relaxed() -> bool:
-    """Development may run without keys; anything else must not."""
-    return settings.environment == Environment.development
+    """Whether an unconfigured key is allowed to pass.
+
+    True in development, or when the operator has explicitly declared the
+    deployment unreachable from the internet via REQUIRE_API_KEYS=false.
+    """
+    return (
+        settings.environment == Environment.development
+        or not settings.require_api_keys
+    )
 
 
 def _check(provided: str, expected: str, label: str) -> None:
     if not _configured(expected):
         if _is_relaxed():
+            reason = (
+                "ENVIRONMENT=development"
+                if settings.environment == Environment.development
+                else "REQUIRE_API_KEYS=false"
+            )
             logger.warning(
                 f"{label} is not configured — allowing the request because "
-                f"ENVIRONMENT=development. Set it before deploying."
+                f"{reason}. This route is open to anyone who can reach the port."
             )
             return
         logger.error(
@@ -85,6 +97,14 @@ async def require_admin_key(x_admin_key: str = Header(default="")) -> None:
 def startup_security_report() -> list[str]:
     """Problems worth logging loudly at boot. Returns human-readable strings."""
     problems: list[str] = []
+
+    if not settings.require_api_keys and settings.environment != Environment.development:
+        problems.append(
+            "REQUIRE_API_KEYS=false — every write route and the entire admin "
+            "surface is UNAUTHENTICATED. Only valid if this port is truly "
+            "unreachable from the internet"
+        )
+
     if not _configured(settings.write_api_key):
         problems.append("WRITE_API_KEY is unset or a placeholder")
     if not _configured(settings.admin_api_key):

@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     write_api_key: str = Field(default="")
     admin_api_key: str = Field(default="")
 
+    # Set false ONLY for a deployment that is genuinely not reachable from the
+    # internet (bound to loopback, or behind a private network / VPN). It makes
+    # every write route and the whole admin surface open to anyone who can
+    # reach the port. A public host — including a *.ondigitalocean.app URL —
+    # does not qualify.
+    require_api_keys: bool = Field(default=True)
+
     # Expose /docs, /redoc and /openapi.json. Off outside development: the
     # schema advertises the admin surface to anonymous visitors.
     enable_docs: bool = Field(default=False)
