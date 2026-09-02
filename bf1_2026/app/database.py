@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
 
@@ -32,12 +31,18 @@ class Base(DeclarativeBase):
     pass
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-)
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency injector for FastAPI – yields an async DB session."""
+    """Dependency injector for FastAPI – yields an async DB session.
+
+    Do NOT wrap this in tenacity's @retry: it replaces the async-generator
+    function with a plain sync wrapper, so FastAPI stops recognising it as a
+    yield-dependency and injects the raw async_generator object instead of a
+    session. Every DB-backed endpoint then fails with
+    "'async_generator' object has no attribute 'execute'".
+
+    Connection-level resilience belongs on the engine (pool_pre_ping above),
+    not on the dependency.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session

@@ -31,7 +31,7 @@ async def create_bet(
     if race is None:
         raise HTTPException(status_code=404, detail="Race not found")
 
-    if is_bet_deadline_passed(race.race_date):
+    if is_bet_deadline_passed(race.race_date, race.deadline_bets):
         raise HTTPException(
             status_code=400,
             detail="Betting deadline has passed (1h before race)",

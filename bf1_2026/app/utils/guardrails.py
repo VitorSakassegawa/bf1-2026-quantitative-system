@@ -46,6 +46,12 @@ DEFAULT_AVG_STOPS = 2.0
 MAX_RACE_POINTS = 26.0
 SPRINT_POINTS_MULTIPLIER = 2.0
 
+# No single-race retirement is a certainty, and no race retires the whole
+# field. Weather scaling (dnf * (1 + weather_risk)) can push a raw probability
+# past 1.0, which made every driver retire in every simulation and pinned the
+# entire grid at the -10 DNF penalty. Cap it below certainty.
+MAX_DNF_PROBABILITY = 0.95
+
 
 def clamp(value: float, lo: float, hi: float) -> float:
     """Clamp a scalar to [lo, hi]."""

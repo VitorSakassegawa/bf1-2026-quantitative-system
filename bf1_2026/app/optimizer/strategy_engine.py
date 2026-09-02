@@ -13,6 +13,17 @@ from app.models_ml.xgboost_model import XGBoostF1Model
 from app.optimizer.ev_calculator import EVCalculator
 from app.optimizer.token_optimizer import TokenOptimizer
 from app.utils.guardrails import PitStopProjector, validate_prediction
+from app.utils.validators import BF1_DNF_PENALTY
+
+
+def _net_expected_points(scoring_points: float, dnf_prob: float) -> float:
+    """Fold the retirement branch into a raw scoring-points estimate.
+
+    Returns the unconditional expectation E[points] = P(finish)*points +
+    P(dnf)*penalty, which is the form EVCalculator expects.
+    """
+    p_dnf = min(max(float(dnf_prob), 0.0), 1.0)
+    return (1.0 - p_dnf) * float(scoring_points) + p_dnf * float(BF1_DNF_PENALTY)
 
 
 class StrategyEngine:
@@ -124,8 +135,17 @@ class StrategyEngine:
                     "dnf_probability_simulated",
                     xgb_pred.get("dnf_probability", 0.05),
                 ),
+                # Must be the unconditional E[points] (DNF penalty included,
+                # sprint multiplier NOT applied) — see EVCalculator's contract.
+                # Monte Carlo already reports it in that form; the XGBoost
+                # fallback reports raw scoring points, so net it here rather
+                # than letting two different quantities share one key.
                 "expected_points": mc_pred.get(
-                    "expected_bf1_points", xgb_pred.get("expected_points", 2.0)
+                    "expected_bf1_points",
+                    _net_expected_points(
+                        xgb_pred.get("expected_points", 2.0),
+                        xgb_pred.get("dnf_probability", 0.05),
+                    ),
                 ),
                 "expected_value": mc_pred.get("expected_value", 0),
             }

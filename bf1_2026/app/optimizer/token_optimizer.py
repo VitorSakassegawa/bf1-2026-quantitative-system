@@ -69,11 +69,21 @@ class TokenOptimizer:
         else:  # balanced
             allocation = self._balanced_allocation(ranked, team_membership)
 
-        # Validate
+        # Validate. The fallback re-runs the same diversity selection, so if
+        # the input itself cannot satisfy the rules (missing team_membership,
+        # too few active drivers) it will fail identically — surface that
+        # instead of silently returning an invalid strategy.
         errors = validate_allocation(allocation, team_membership)
         if errors:
             logger.warning(f"Allocation constraint violations: {errors}")
             allocation = self._fallback_allocation(ranked, team_membership)
+            errors = validate_allocation(allocation, team_membership)
+            if errors:
+                logger.error(
+                    f"Fallback allocation still violates BF1 rules: {errors}. "
+                    "Check that team_membership is populated and that enough "
+                    "drivers are active."
+                )
 
         total_ev = self.ev_calc.calculate_portfolio_ev(
             allocation, predictions, is_sprint
@@ -90,9 +100,14 @@ class TokenOptimizer:
 
         return {
             "allocation": allocation,
-            "total_ev": total_ev,
+            # EV net of the team-correlation penalty, which was previously
+            # computed and then discarded — reported next to total_ev as if it
+            # had been accounted for, but never actually subtracted.
+            "total_ev": round(total_ev - corr_penalty, 4),
+            "gross_ev": total_ev,
             "correlation_penalty": corr_penalty,
             "strategy_type": strategy_type,
+            "constraint_errors": errors,
         }
 
     def _rank_by_ev(
@@ -115,12 +130,20 @@ class TokenOptimizer:
         team_membership: dict[str, str],
         min_drivers: int = 5,
     ) -> list[str]:
-        """Select at least min_drivers from different teams."""
+        """Select at least min_drivers from different teams.
+
+        A driver with no known team must NOT be counted as a team of its own:
+        `validate_allocation` skips falsy teams, so inventing `unknown_<id>`
+        here made the two disagree, and an allocation covering zero real teams
+        would satisfy this method while failing validation.
+        """
         selected: list[str] = []
         teams_used: set[str] = set()
 
         for did, ev, pred in candidates:
-            team = team_membership.get(did, f"unknown_{did}")
+            team = team_membership.get(did)
+            if not team:
+                continue
             if team not in teams_used:
                 selected.append(did)
                 teams_used.add(team)
@@ -225,25 +248,55 @@ class TokenOptimizer:
         return self._fix_total(allocation)
 
     def _fix_total(self, allocation: dict[str, int]) -> dict[str, int]:
-        """Ensure total is exactly 15 tokens."""
+        """Ensure the total is exactly TOTAL_TOKENS, or give up cleanly.
+
+        Both loops used to spin forever whenever a full pass could make no
+        progress — e.g. every selected driver already at MAX_PER_DRIVER while
+        the total was still short (reachable with fewer than 3 active drivers
+        in the DB), or every driver at 1 token while the total was still over.
+        That was an un-loggable 100% CPU spin holding the event loop, not an
+        exception, so nothing restarted the container.
+
+        Each pass now has to change something; if it cannot, the allocation is
+        infeasible and we stop and report it rather than hang.
+        """
         total = sum(allocation.values())
         drivers = list(allocation.keys())
 
         while total < self.TOTAL_TOKENS and drivers:
+            progressed = False
             for did in drivers:
                 if allocation[did] < self.MAX_PER_DRIVER:
                     allocation[did] += 1
                     total += 1
+                    progressed = True
                 if total >= self.TOTAL_TOKENS:
                     break
+            if not progressed:
+                logger.warning(
+                    f"Cannot reach {self.TOTAL_TOKENS} tokens: {len(drivers)} "
+                    f"driver(s) all at the {self.MAX_PER_DRIVER}-token cap "
+                    f"(total={total}). Need at least "
+                    f"{-(-self.TOTAL_TOKENS // self.MAX_PER_DRIVER)} drivers."
+                )
+                break
 
         while total > self.TOTAL_TOKENS and drivers:
+            progressed = False
             for did in reversed(drivers):
                 if allocation[did] > 1:
                     allocation[did] -= 1
                     total -= 1
+                    progressed = True
                 if total <= self.TOTAL_TOKENS:
                     break
+            if not progressed:
+                logger.warning(
+                    f"Cannot reduce to {self.TOTAL_TOKENS} tokens: "
+                    f"{len(drivers)} driver(s) all at the 1-token floor "
+                    f"(total={total})."
+                )
+                break
 
         return allocation
 

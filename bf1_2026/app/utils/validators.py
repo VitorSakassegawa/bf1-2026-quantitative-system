@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 BF1_TOTAL_TOKENS = 15
@@ -60,13 +60,36 @@ def validate_allocation(
     return errors
 
 
-def is_bet_deadline_passed(race_date: datetime) -> bool:
-    """Check if the betting deadline (1h before race) has passed."""
-    now = datetime.now(timezone.utc)
-    from datetime import timedelta
+def bet_deadline_for(race_date: datetime, deadline_bets: datetime | None = None) -> datetime:
+    """The instant betting closes: the stored deadline, else 1h before lights out."""
+    if deadline_bets is not None:
+        return _as_utc(deadline_bets)
+    return _as_utc(race_date) - timedelta(hours=1)
 
-    deadline = race_date - timedelta(hours=1)
-    return now >= deadline
+
+def is_bet_deadline_passed(
+    race_date: datetime,
+    deadline_bets: datetime | None = None,
+) -> bool:
+    """Check whether betting has closed for a race.
+
+    Pass the race's stored `deadline_bets` whenever it is available. Deriving
+    the deadline from `race_date` alone is only safe if `race_date` is the real
+    session start: seeded races used to carry a placeholder 14:00 UTC, so for
+    an early race (Melbourne starts 04:00 UTC) the derived deadline landed
+    ~9 hours *after* the chequered flag and bets could still be placed on a
+    race whose result was already public.
+
+    Naive datetimes are treated as UTC rather than compared against an aware
+    `now`, which would raise TypeError.
+    """
+    now = datetime.now(timezone.utc)
+    return now >= bet_deadline_for(race_date, deadline_bets)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Normalise a possibly-naive datetime to an aware UTC one."""
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 def calculate_bf1_points(position: int | None, dnf: bool, fastest_lap: bool) -> float:

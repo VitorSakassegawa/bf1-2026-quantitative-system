@@ -101,7 +101,10 @@ async def bet_select_strategy(
             f"  {escape_md(d['driver_code'])}: \\[{escape_md(bar)}\\] {d['tokens']}T"
         )
     lines.append("")
-    lines.append(f"Total EV: {strategy.get('total_ev', 0):.1f} \\| 15 tokens")
+    # Escape the decimal point: an unescaped "." breaks MarkdownV2 parsing and
+    # Telegram rejects the message with 400, so /bet silently dead-ends.
+    total_ev = escape_md(f"{strategy.get('total_ev', 0):.1f}")
+    lines.append(f"Total EV: {total_ev} \\| 15 tokens")
 
     keyboard = [
         [InlineKeyboardButton("Confirm", callback_data="confirm_yes")],
@@ -140,7 +143,7 @@ async def bet_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await query.edit_message_text("Race not found.")
             return ConversationHandler.END
 
-        if is_bet_deadline_passed(race.race_date):
+        if is_bet_deadline_passed(race.race_date, race.deadline_bets):
             await query.edit_message_text(
                 "⏰ Betting is closed for this race (deadline is 1h before start)."
             )

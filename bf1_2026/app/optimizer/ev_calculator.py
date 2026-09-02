@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from app.utils.validators import BF1_DNF_PENALTY, BF1_POINTS_TABLE
+from app.utils.validators import BF1_SPRINT_MULTIPLIER
 
 
 class EVCalculator:
     """Calculate expected values for driver–token allocations."""
 
-    SPRINT_MULTIPLIER = 2.0
+    # Sourced from the rules module rather than re-declared, so the engine and
+    # the spec cannot drift apart.
+    SPRINT_MULTIPLIER = BF1_SPRINT_MULTIPLIER
 
     def calculate_driver_ev(
         self,
@@ -16,24 +18,28 @@ class EVCalculator:
         tokens: int,
         is_sprint: bool = False,
     ) -> float:
-        """
-        Expected Value for a single driver with N tokens.
+        """Expected Value for a single driver with N tokens.
 
-        EV = tokens * (
-            (top10_prob * expected_points * sprint_mult)
-            - (dnf_prob * 10)
-        )
-        """
-        top10_prob = prediction.get("top10_probability", 0.5)
-        expected_pts = prediction.get("expected_points", 2.0)
-        dnf_prob = prediction.get("dnf_probability", 0.05)
+            EV = tokens * expected_points * sprint_multiplier
 
+        CONTRACT: `prediction["expected_points"]` is the *unconditional*
+        expected BF1 points for the session — it already integrates over
+        finishing positions and already carries BF1_DNF_PENALTY for the
+        retirement mass. It is NOT pre-scaled by the sprint multiplier; that
+        is applied here, in exactly one place.
+
+        The previous formula multiplied that expectation by `top10_probability`
+        and then subtracted `dnf_prob * 10` on top, double-charging retirements
+        and re-applying a scoring probability already baked into the value. The
+        error scaled with each driver's own probabilities, so it distorted the
+        *ranking*, not just the magnitude: midfielders came out at ~0.25x their
+        true EV and backmarkers went negative, which pushed the optimizer off
+        the drivers the team-diversity rule forces it to pick.
+        """
+        expected_pts = prediction.get("expected_points", 0.0)
         sprint_mult = self.SPRINT_MULTIPLIER if is_sprint else 1.0
 
-        ev = tokens * (
-            (top10_prob * expected_pts * sprint_mult)
-            - (dnf_prob * abs(BF1_DNF_PENALTY))
-        )
+        ev = tokens * expected_pts * sprint_mult
         return round(ev, 4)
 
     def calculate_portfolio_ev(

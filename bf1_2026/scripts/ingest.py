@@ -88,11 +88,19 @@ async def _race_exists(session, season: int, rnd: int) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-def _parse_date(date_str: str) -> datetime:
+def _parse_date(date_str: str) -> datetime | None:
+    """Parse an ISO date, or return None if it cannot be trusted.
+
+    This used to fall back to `datetime.now()`, which stamped every
+    unparseable race with the moment the script ran. A whole season could end
+    up sharing one timestamp, destroying the chronological ordering that ELO
+    replay and the model's TimeSeriesSplit both depend on — silently. Returning
+    None lets the caller skip the race loudly instead.
+    """
     try:
         return datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
-        return datetime.now(timezone.utc)
+        return None
 
 
 async def ingest_season(collector: F1ApiFallback, season: int) -> None:
@@ -108,9 +116,29 @@ async def ingest_season(collector: F1ApiFallback, season: int) -> None:
                 logger.debug(f"{season} R{rnd} already ingested, skipping")
                 continue
 
+            # Fetch results BEFORE writing anything. A race row committed with
+            # zero results is never repaired: the next run sees _race_exists()
+            # and skips it forever, so a single transient 429 used to erase a
+            # Grand Prix from the dataset permanently, with only a warning.
+            results = await collector.fetch_race_results(season, rnd)
+            if not results:
+                logger.warning(
+                    f"{season} R{rnd}: no results returned — leaving it "
+                    "un-ingested so a later run can retry it."
+                )
+                continue
+
+            race_date = _parse_date(race.get("date", ""))
+            if race_date is None:
+                logger.warning(
+                    f"{season} R{rnd}: unparseable date {race.get('date')!r} — "
+                    "skipping rather than corrupting the chronology."
+                )
+                continue
+
             circuit = await _get_or_create_circuit(
                 session,
-                race.get("circuit", race.get("race_name", "")),
+                race.get("circuit") or race.get("race_name", ""),
                 race.get("country", ""),
                 race.get("latitude", 0.0),
                 race.get("longitude", 0.0),
@@ -121,7 +149,7 @@ async def ingest_season(collector: F1ApiFallback, season: int) -> None:
                 season=season,
                 round_number=rnd,
                 race_name=race.get("race_name", f"Round {rnd}"),
-                race_date=_parse_date(race.get("date", "")),
+                race_date=race_date,
                 is_sprint_weekend=race.get("is_sprint", False),
                 status=RaceStatus.finished,
             )
@@ -135,8 +163,7 @@ async def ingest_season(collector: F1ApiFallback, season: int) -> None:
                 if ref:
                     pit_counts[ref] = pit_counts.get(ref, 0) + 1
 
-            # --- Race results ---
-            results = await collector.fetch_race_results(season, rnd)
+            # --- Race results (already fetched above) ---
             for r in results:
                 team = await _get_or_create_team(session, r.get("team", ""))
                 driver = await _get_or_create_driver(

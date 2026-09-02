@@ -1,0 +1,10 @@
+# Test / development dependencies.
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests/ -q
+-r requirements.txt
+
+pytest==8.3.3
+pytest-asyncio==0.24.0
+# Provides the @pytest.mark.timeout marker used by the allocator regression
+# tests, which pin down a loop that previously never terminated.
+pytest-timeout==2.3.1

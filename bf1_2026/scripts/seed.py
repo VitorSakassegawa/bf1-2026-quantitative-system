@@ -22,8 +22,14 @@ from app.models.driver import Driver
 from app.models.race import Race, RaceStatus
 from app.models.team import Team
 
-# Current grid: 10 teams, 2 drivers each. Driver `code` is the stable key the
-# ingestion step matches results against (Ergast uses the same 3-letter codes).
+# Current grid: 11 teams, 2 drivers each (22 drivers).
+#
+# 2026 is a regulation-reset season: Cadillac joins as the 11th team and Audi
+# takes over the Sauber entry as a full works constructor. Only one driver
+# changed teams (Hadjar, promoted to Red Bull); Lindblad is the sole rookie.
+#
+# Driver `code` is the stable key the ingestion step matches results against
+# (Ergast/Jolpica uses the same 3-letter codes).
 GRID: list[dict] = [
     {
         "team": "McLaren",
@@ -46,7 +52,7 @@ GRID: list[dict] = [
         "full_name": "Oracle Red Bull Racing",
         "drivers": [
             {"name": "Max Verstappen", "code": "VER", "number": 1, "nat": "Dutch"},
-            {"name": "Yuki Tsunoda", "code": "TSU", "number": 22, "nat": "Japanese"},
+            {"name": "Isack Hadjar", "code": "HAD", "number": 6, "nat": "French"},
         ],
     },
     {
@@ -86,7 +92,7 @@ GRID: list[dict] = [
         "full_name": "Visa Cash App Racing Bulls F1 Team",
         "drivers": [
             {"name": "Liam Lawson", "code": "LAW", "number": 30, "nat": "New Zealander"},
-            {"name": "Isack Hadjar", "code": "HAD", "number": 6, "nat": "French"},
+            {"name": "Arvid Lindblad", "code": "LIN", "number": 41, "nat": "British"},
         ],
     },
     {
@@ -98,11 +104,19 @@ GRID: list[dict] = [
         ],
     },
     {
-        "team": "Kick Sauber",
-        "full_name": "Stake F1 Team Kick Sauber",
+        "team": "Audi",
+        "full_name": "Audi F1 Team",
         "drivers": [
             {"name": "Nico Hulkenberg", "code": "HUL", "number": 27, "nat": "German"},
             {"name": "Gabriel Bortoleto", "code": "BOR", "number": 5, "nat": "Brazilian"},
+        ],
+    },
+    {
+        "team": "Cadillac",
+        "full_name": "Cadillac Formula 1 Team",
+        "drivers": [
+            {"name": "Sergio Perez", "code": "PER", "number": 11, "nat": "Mexican"},
+            {"name": "Valtteri Bottas", "code": "BOT", "number": 77, "nat": "Finnish"},
         ],
     },
 ]
@@ -145,41 +159,61 @@ async def upsert_driver(session, team: Team, d: dict) -> Driver:
     return driver
 
 
-# 2026 calendar: (round, name, date, sprint, country, city). Circuits are linked
-# to existing historical rows by country so KPIs carry over; created otherwise.
+# 2026 calendar: 22 rounds.
+#
+# The Bahrain and Saudi Arabian Grands Prix (originally rounds 4 and 5) were
+# cancelled and not replaced, so the season runs to 22 races and every round
+# from Miami onwards is numbered two lower than the original schedule.
+#
+# `time_utc` is the scheduled race start converted to UTC. It matters: the
+# betting deadline is derived from the race start, so a placeholder time
+# (this used to be a blanket 14:00 UTC) leaves bets open after the flag has
+# dropped. Saturday races (Baku, Las Vegas) are marked accordingly — the Las
+# Vegas night race starts on the Sunday in UTC.
+#
+# Sprint rounds in 2026: China, Miami, Canada, Great Britain, Netherlands
+# and Singapore.
 CALENDAR_2026: list[dict] = [
-    {"round": 1, "name": "Australian GP", "date": "2026-03-08", "sprint": False, "country": "Australia", "city": "Melbourne"},
-    {"round": 2, "name": "Chinese GP", "date": "2026-03-22", "sprint": True, "country": "China", "city": "Shanghai"},
-    {"round": 3, "name": "Japanese GP", "date": "2026-04-05", "sprint": False, "country": "Japan", "city": "Suzuka"},
-    {"round": 4, "name": "Bahrain GP", "date": "2026-04-12", "sprint": False, "country": "Bahrain", "city": "Sakhir"},
-    {"round": 5, "name": "Saudi Arabian GP", "date": "2026-04-26", "sprint": False, "country": "Saudi Arabia", "city": "Jeddah"},
-    {"round": 6, "name": "Miami GP", "date": "2026-05-03", "sprint": True, "country": "USA", "city": "Miami"},
-    {"round": 7, "name": "Canadian GP", "date": "2026-05-24", "sprint": True, "country": "Canada", "city": "Montreal"},
-    {"round": 8, "name": "Monaco GP", "date": "2026-06-07", "sprint": False, "country": "Monaco", "city": "Monte Carlo"},
-    {"round": 9, "name": "Spanish GP", "date": "2026-06-14", "sprint": False, "country": "Spain", "city": "Barcelona"},
-    {"round": 10, "name": "Austrian GP", "date": "2026-06-28", "sprint": False, "country": "Austria", "city": "Spielberg"},
-    {"round": 11, "name": "British GP", "date": "2026-07-05", "sprint": False, "country": "UK", "city": "Silverstone"},
-    {"round": 12, "name": "Belgian GP", "date": "2026-07-19", "sprint": True, "country": "Belgium", "city": "Spa"},
-    {"round": 13, "name": "Hungarian GP", "date": "2026-07-26", "sprint": False, "country": "Hungary", "city": "Budapest"},
-    {"round": 14, "name": "Dutch GP", "date": "2026-08-23", "sprint": False, "country": "Netherlands", "city": "Zandvoort"},
-    {"round": 15, "name": "Italian GP", "date": "2026-09-06", "sprint": False, "country": "Italy", "city": "Monza"},
-    {"round": 16, "name": "Spanish GP (Madrid)", "date": "2026-09-13", "sprint": False, "country": "Spain", "city": "Madrid"},
-    {"round": 17, "name": "Azerbaijan GP", "date": "2026-09-27", "sprint": False, "country": "Azerbaijan", "city": "Baku"},
-    {"round": 18, "name": "Singapore GP", "date": "2026-10-11", "sprint": True, "country": "Singapore", "city": "Singapore"},
-    {"round": 19, "name": "United States GP", "date": "2026-10-25", "sprint": False, "country": "USA", "city": "Austin"},
-    {"round": 20, "name": "Mexico City GP", "date": "2026-11-01", "sprint": False, "country": "Mexico", "city": "Mexico City"},
-    {"round": 21, "name": "Brazilian GP", "date": "2026-11-08", "sprint": False, "country": "Brazil", "city": "Sao Paulo"},
-    {"round": 22, "name": "Las Vegas GP", "date": "2026-11-21", "sprint": False, "country": "USA", "city": "Las Vegas"},
-    {"round": 23, "name": "Qatar GP", "date": "2026-11-29", "sprint": False, "country": "Qatar", "city": "Lusail"},
-    {"round": 24, "name": "Abu Dhabi GP", "date": "2026-12-06", "sprint": False, "country": "UAE", "city": "Yas Marina"},
+    {"round": 1, "name": "Australian GP", "date": "2026-03-08", "time_utc": "04:00", "sprint": False, "country": "Australia", "city": "Melbourne"},
+    {"round": 2, "name": "Chinese GP", "date": "2026-03-15", "time_utc": "07:00", "sprint": True, "country": "China", "city": "Shanghai"},
+    {"round": 3, "name": "Japanese GP", "date": "2026-03-29", "time_utc": "05:00", "sprint": False, "country": "Japan", "city": "Suzuka"},
+    {"round": 4, "name": "Miami GP", "date": "2026-05-03", "time_utc": "20:00", "sprint": True, "country": "USA", "city": "Miami"},
+    {"round": 5, "name": "Canadian GP", "date": "2026-05-24", "time_utc": "18:00", "sprint": True, "country": "Canada", "city": "Montreal"},
+    {"round": 6, "name": "Monaco GP", "date": "2026-06-07", "time_utc": "13:00", "sprint": False, "country": "Monaco", "city": "Monte Carlo"},
+    {"round": 7, "name": "Spanish GP", "date": "2026-06-14", "time_utc": "13:00", "sprint": False, "country": "Spain", "city": "Barcelona"},
+    {"round": 8, "name": "Austrian GP", "date": "2026-06-28", "time_utc": "13:00", "sprint": False, "country": "Austria", "city": "Spielberg"},
+    {"round": 9, "name": "British GP", "date": "2026-07-05", "time_utc": "14:00", "sprint": True, "country": "UK", "city": "Silverstone"},
+    {"round": 10, "name": "Belgian GP", "date": "2026-07-19", "time_utc": "13:00", "sprint": False, "country": "Belgium", "city": "Spa"},
+    {"round": 11, "name": "Hungarian GP", "date": "2026-07-26", "time_utc": "13:00", "sprint": False, "country": "Hungary", "city": "Budapest"},
+    {"round": 12, "name": "Dutch GP", "date": "2026-08-23", "time_utc": "13:00", "sprint": True, "country": "Netherlands", "city": "Zandvoort"},
+    {"round": 13, "name": "Italian GP", "date": "2026-09-06", "time_utc": "13:00", "sprint": False, "country": "Italy", "city": "Monza"},
+    {"round": 14, "name": "Madrid GP", "date": "2026-09-13", "time_utc": "13:00", "sprint": False, "country": "Spain", "city": "Madrid"},
+    {"round": 15, "name": "Azerbaijan GP", "date": "2026-09-26", "time_utc": "11:00", "sprint": False, "country": "Azerbaijan", "city": "Baku"},
+    {"round": 16, "name": "Singapore GP", "date": "2026-10-11", "time_utc": "12:00", "sprint": True, "country": "Singapore", "city": "Singapore"},
+    {"round": 17, "name": "United States GP", "date": "2026-10-25", "time_utc": "19:00", "sprint": False, "country": "USA", "city": "Austin"},
+    {"round": 18, "name": "Mexico City GP", "date": "2026-11-01", "time_utc": "20:00", "sprint": False, "country": "Mexico", "city": "Mexico City"},
+    {"round": 19, "name": "Brazilian GP", "date": "2026-11-08", "time_utc": "17:00", "sprint": False, "country": "Brazil", "city": "Sao Paulo"},
+    {"round": 20, "name": "Las Vegas GP", "date": "2026-11-22", "time_utc": "04:00", "sprint": False, "country": "USA", "city": "Las Vegas"},
+    {"round": 21, "name": "Qatar GP", "date": "2026-11-29", "time_utc": "16:00", "sprint": False, "country": "Qatar", "city": "Lusail"},
+    {"round": 22, "name": "Abu Dhabi GP", "date": "2026-12-06", "time_utc": "13:00", "sprint": False, "country": "UAE", "city": "Yas Marina"},
 ]
 
 
 async def _link_circuit(session, gp: dict) -> Circuit:
-    """Reuse an existing circuit for that country, else create a new one."""
+    """Reuse the circuit for that city, else create a new one.
+
+    Matching on country alone collapsed distinct venues into one row: the three
+    US rounds (Miami, Austin, Las Vegas) all shared a single circuit, as did
+    Barcelona and Madrid. Circuit KPIs (overtaking index, DNF rate, tyre
+    degradation) are venue-specific, so that silently blended Monaco-like and
+    Monza-like tracks together. City + country is the unique key.
+    """
     existing = (
         await session.execute(
-            select(Circuit).where(func.lower(Circuit.country) == gp["country"].lower())
+            select(Circuit).where(
+                func.lower(Circuit.city) == gp["city"].lower(),
+                func.lower(Circuit.country) == gp["country"].lower(),
+            )
         )
     ).scalars().first()
     if existing:
@@ -209,8 +243,9 @@ async def seed_calendar(session, season: int = 2026) -> int:
         if exists:
             continue
         circuit = await _link_circuit(session, gp)
+        hour, minute = (int(x) for x in gp["time_utc"].split(":"))
         race_date = datetime.strptime(gp["date"], "%Y-%m-%d").replace(
-            hour=14, tzinfo=timezone.utc
+            hour=hour, minute=minute, tzinfo=timezone.utc
         )
         session.add(
             Race(

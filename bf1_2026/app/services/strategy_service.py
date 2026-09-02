@@ -231,7 +231,14 @@ async def build_strategy(
         weather=weather,
         team_membership=team_membership,
         user_aggressiveness=aggressiveness,
-        is_sprint=race.is_sprint_weekend,
+        # These are two different things. `is_sprint` means "the session being
+        # predicted IS the sprint race"; `is_sprint_weekend` means "this GP is
+        # part of a weekend that also contains a sprint". This service builds a
+        # strategy for the Grand Prix, so is_sprint is always False — passing
+        # the weekend flag here doubled the GP's points and clamped the
+        # pit-stop projection to the sprint window (a 3-stop race reported as
+        # a 1-stopper).
+        is_sprint=False,
         is_sprint_weekend=race.is_sprint_weekend,
         n_simulations=n_sims,
         confidence=confidence,

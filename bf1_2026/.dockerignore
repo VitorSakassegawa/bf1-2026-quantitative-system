@@ -1,0 +1,30 @@
+# The Dockerfile does `COPY . .`, and the documented deploy flow creates a
+# real .env in this directory before building. Without this file that .env —
+# POSTGRES_PASSWORD, TELEGRAM_BOT_TOKEN, OPENWEATHER_API_KEY, SECRET_KEY —
+# is baked into an image layer and readable by anyone who can pull it.
+.env
+.env.*
+!.env.template
+
+# VCS and local tooling
+.git
+.gitignore
+.github
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local data that should never ship in the image
+logs/
+models_storage/
+*.log
+*.sqlite3

@@ -9,6 +9,7 @@ import numpy as np
 from loguru import logger
 
 from app.utils.guardrails import (
+    MAX_DNF_PROBABILITY,
     clamp_expected_points,
     clamp_position,
     clamp_probability,
@@ -85,8 +86,13 @@ class MonteCarloSimulator:
         elo_arr = np.array([d.get("elo", 1500) for d in drivers], dtype=np.float64)
         wet_perf = np.array([d.get("wet_performance", 0.0) for d in drivers], dtype=np.float64)
 
-        # Adjust DNF probs for weather
-        dnf_probs_adj = dnf_probs * (1.0 + weather_risk)
+        # Adjust DNF probs for weather, then clamp back into a possible range.
+        # Without the clamp a wet race (weather_risk=0.8) on an already
+        # unreliable car (0.6) produced p=1.08 — a guaranteed retirement for
+        # every driver in every simulation, pinning the whole field at -10.
+        dnf_probs_adj = np.clip(
+            dnf_probs * (1.0 + weather_risk), 0.0, MAX_DNF_PROBABILITY
+        )
 
         for sim in range(n_sims):
             result = self._single_simulation(
@@ -99,7 +105,6 @@ class MonteCarloSimulator:
 
         # Aggregate results
         results: dict = {}
-        sprint_mult = self.SPRINT_MULTIPLIER if is_sprint else 1.0
 
         for i, driver in enumerate(drivers):
             did = driver["driver_id"]
@@ -107,16 +112,29 @@ class MonteCarloSimulator:
             dnf_series = dnf_all[:, i]
             pts_series = points_all[:, i]
 
-            # Position distribution histogram (1-20)
-            pos_dist = np.bincount(pos_series, minlength=21)[1:21].tolist()
+            # Position distribution histogram (1..n_drivers). Hard-coding 20
+            # slots silently discarded P21/P22 outcomes on a 22-car grid, so
+            # the distribution no longer summed to n_sims.
+            pos_dist = np.bincount(
+                pos_series, minlength=n_drivers + 1
+            )[1:n_drivers + 1].tolist()
 
-            avg_pos = float(pos_series[~dnf_series].mean()) if (~dnf_series).any() else 20.0
+            # avg_position must use the same (unconditional) denominator as the
+            # probabilities below. Averaging only over finishes made a driver
+            # who retires 9 races in 10 look like a P1.35 car.
+            avg_pos = float(pos_series.mean()) if len(pos_series) else float(n_drivers)
             top3_prob = float((pos_series <= 3).mean())
             top10_prob = float((pos_series <= 10).mean())
             dnf_sim = float(dnf_series.mean())
-            avg_pts = float(pts_series.mean()) * sprint_mult
 
-            avg_pts = clamp_expected_points(avg_pts, is_sprint)
+            # `pts_series` already carries BF1_DNF_PENALTY for retirements, so
+            # this mean is the full unconditional E[points] for the session.
+            # The sprint multiplier is deliberately NOT applied here — it is
+            # applied once, in EVCalculator. Applying it in both places scaled
+            # sprint EV by 4x.
+            avg_pts = float(pts_series.mean())
+
+            avg_pts = clamp_expected_points(avg_pts, is_sprint=False)
             results[did] = {
                 "avg_position": round(clamp_position(avg_pos, n_drivers), 2),
                 "top3_probability": round(clamp_probability(top3_prob), 4),
@@ -202,14 +220,15 @@ class MonteCarloSimulator:
         token_allocation: int,
         is_sprint: bool = False,
     ) -> float:
+        """EV = tokens * E[points] * sprint_multiplier.
+
+        `expected_bf1_points` is already the unconditional expectation over all
+        simulations, with BF1_DNF_PENALTY included for the retirement draws.
+        Re-weighting it by (1 - dnf_prob) and then subtracting the penalty a
+        second time charged every retirement twice.
         """
-        EV = (prob_score * avg_points * tokens) - (prob_DNF * 10 * tokens)
-        """
-        avg_pts = simulation_results.get("expected_bf1_points", 0)
-        dnf_prob = simulation_results.get("dnf_probability_simulated", 0.05)
+        avg_pts = simulation_results.get("expected_bf1_points", 0.0)
 
         mult = self.SPRINT_MULTIPLIER if is_sprint else 1.0
-        ev = token_allocation * (
-            (1 - dnf_prob) * avg_pts * mult - dnf_prob * abs(BF1_DNF_PENALTY)
-        )
+        ev = token_allocation * avg_pts * mult
         return round(ev, 2)

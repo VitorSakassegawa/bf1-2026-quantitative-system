@@ -1,6 +1,10 @@
-"""F1 API fallback – Ergast and OpenF1 APIs as backup data source."""
+"""F1 API fallback – Jolpica (Ergast-compatible) and OpenF1 as data source."""
 
 from __future__ import annotations
+
+import asyncio
+import re
+import time
 
 import httpx
 from loguru import logger
@@ -11,15 +15,26 @@ from app.config import settings
 
 class F1ApiFallback:
     """
-    Fallback data collector using Ergast API and OpenF1 API.
+    Fallback data collector using the Jolpica and OpenF1 APIs.
     Provides the same interface as F1DataCollector.
     """
 
-    BASE_URL_ERGAST = "http://ergast.com/api/f1"
+    # ergast.com was frozen after the 2024 season and the host no longer
+    # serves current data. Jolpica is the drop-in successor: identical JSON
+    # shape and path structure, so only the base URL changes.
+    BASE_URL_ERGAST = "https://api.jolpi.ca/ergast/f1"
     BASE_URL_OPENF1 = "https://api.openf1.org/v1"
+
+    # Ergast-compatible endpoints default to limit=30 and silently truncate.
+    # A modern GP has ~50 pit stops, so the default cut them off mid-race.
+    PAGE_LIMIT = 100
+    # Jolpica publishes a 4 req/s burst limit; stay under it.
+    MIN_REQUEST_INTERVAL = 0.35
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._last_request_at = 0.0
+        self._rate_lock = asyncio.Lock()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -29,20 +44,66 @@ class F1ApiFallback:
             )
         return self._client
 
+    async def _rate_limit(self) -> None:
+        """Space out requests. Ingest issues ~4 calls per race back-to-back."""
+        async with self._rate_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+            self._last_request_at = time.monotonic()
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
     )
     async def _fetch_json(self, url: str) -> dict:
+        await self._rate_limit()
         client = await self._get_client()
         logger.debug(f"API fallback fetching {url}")
         resp = await client.get(url)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+        # Warn loudly if the server holds more rows than we asked for, rather
+        # than silently analysing a truncated race.
+        mrdata = data.get("MRData", {})
+        try:
+            total = int(mrdata.get("total", 0))
+            limit = int(mrdata.get("limit", 0))
+            offset = int(mrdata.get("offset", 0))
+            if total > offset + limit:
+                logger.warning(
+                    f"Truncated response from {url}: {total} rows available, "
+                    f"got {limit} at offset {offset}. Raise PAGE_LIMIT or page."
+                )
+        except (TypeError, ValueError):
+            pass
+        return data
+
+    def _paged(self, path: str) -> str:
+        """Build an Ergast-style URL with an explicit, non-default limit."""
+        sep = "&" if "?" in path else "?"
+        return f"{path}{sep}limit={self.PAGE_LIMIT}"
+
+    @staticmethod
+    def _is_dnf(status: str) -> bool:
+        """True only for genuine non-finishes.
+
+        A driver classified any number of laps down still finished. The old
+        allowlist stopped at "+3 Laps", so "+4 Laps" and beyond were recorded
+        as retirements *with* a valid finishing position — which then flowed
+        into ELO (forced to P20), circuit DNF rates, team reliability and the
+        XGBoost training label. Matching the "+N Lap(s)" pattern instead of
+        enumerating it keeps classified finishers on the right side.
+        """
+        s = (status or "").strip()
+        if s == "Finished":
+            return False
+        return re.fullmatch(r"\+\d+ Laps?", s) is None
 
     async def fetch_calendar(self, season: int) -> list[dict]:
         """Fetch race calendar from Ergast API."""
-        url = f"{self.BASE_URL_ERGAST}/{season}.json"
+        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}.json")
         try:
             data = await self._fetch_json(url)
             races_raw = (
@@ -62,7 +123,12 @@ class F1ApiFallback:
                         .get("Location", {})
                         .get("country", ""),
                         "date": race.get("date", ""),
-                        "is_sprint": "Sprint" in race.get("raceName", ""),
+                        # Sprint weekends are flagged by a separate "Sprint"
+                        # object on the race, not by the race name: raceName is
+                        # always "<Country> Grand Prix" and never contains the
+                        # word "Sprint", so the old substring test was always
+                        # False and sprint results were never ingested at all.
+                        "is_sprint": bool(race.get("Sprint")),
                         "latitude": float(
                             race.get("Circuit", {})
                             .get("Location", {})
@@ -111,7 +177,7 @@ class F1ApiFallback:
         self, season: int, round_num: int
     ) -> list[dict]:
         """Fetch qualifying results from Ergast API."""
-        url = f"{self.BASE_URL_ERGAST}/{season}/{round_num}/qualifying.json"
+        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/qualifying.json")
         try:
             data = await self._fetch_json(url)
             quali_raw = (
@@ -145,7 +211,7 @@ class F1ApiFallback:
 
     async def fetch_race_results(self, season: int, round_num: int) -> list[dict]:
         """Fetch race results from Ergast API."""
-        url = f"{self.BASE_URL_ERGAST}/{season}/{round_num}/results.json"
+        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/results.json")
         try:
             data = await self._fetch_json(url)
             results_raw = (
@@ -160,7 +226,7 @@ class F1ApiFallback:
                 driver = r.get("Driver", {})
                 constructor = r.get("Constructor", {})
                 status = r.get("status", "")
-                dnf = status not in ("Finished", "+1 Lap", "+2 Laps", "+3 Laps")
+                dnf = self._is_dnf(status)
 
                 pos_text = r.get("position", "")
                 position = int(pos_text) if pos_text.isdigit() else None
@@ -191,7 +257,7 @@ class F1ApiFallback:
 
     async def fetch_sprint_results(self, season: int, round_num: int) -> list[dict]:
         """Fetch sprint results from Ergast API."""
-        url = f"{self.BASE_URL_ERGAST}/{season}/{round_num}/sprint.json"
+        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/sprint.json")
         try:
             data = await self._fetch_json(url)
             sprint_raw = (
@@ -205,7 +271,7 @@ class F1ApiFallback:
             for r in sprint_raw:
                 driver = r.get("Driver", {})
                 status = r.get("status", "")
-                dnf = status not in ("Finished", "+1 Lap")
+                dnf = self._is_dnf(status)
                 pos_text = r.get("position", "")
 
                 results.append(
@@ -228,7 +294,7 @@ class F1ApiFallback:
 
     async def fetch_pit_stops(self, season: int, round_num: int) -> list[dict]:
         """Fetch pit stop data from Ergast API."""
-        url = f"{self.BASE_URL_ERGAST}/{season}/{round_num}/pitstops.json"
+        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/pitstops.json")
         try:
             data = await self._fetch_json(url)
             pits_raw = (

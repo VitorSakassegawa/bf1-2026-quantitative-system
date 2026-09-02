@@ -33,9 +33,13 @@ def format_race_analysis(analysis: dict) -> str:
     ]
 
     for i, d in enumerate(analysis.get("top_drivers", [])[:5], 1):
+        # The decimal point in a formatted float must be escaped for
+        # MarkdownV2, otherwise Telegram rejects the entire message with
+        # 400 "can't parse entities" and the user sees nothing at all.
+        ev = escape_md(f"{d['ev']:.1f}")
         lines.append(
             f"  {i}\\. {escape_md(d['code'])} — "
-            f"EV: {d['ev']:.1f} \\| "
+            f"EV: {ev} \\| "
             f"🏆{d['top3']:.0%} \\| "
             f"⚠️DNF:{d['dnf']:.0%}"
         )

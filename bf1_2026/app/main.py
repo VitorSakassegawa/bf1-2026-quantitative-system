@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -29,22 +30,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Database init skipped/failed: {e}")
 
-    # Start scheduler
-    try:
-        from app.scheduler.jobs import start_scheduler
-        start_scheduler()
-        logger.info("Scheduler started")
-    except Exception as e:
-        logger.warning(f"Scheduler failed to start: {e}")
+    # The scheduler runs in its own container (`python -m app.scheduler.run`,
+    # the bf1_scheduler service). Starting it here as well made every job fire
+    # twice — duplicate upstream fetches, duplicate ingestion, and two
+    # concurrent retrains writing the same models_storage volume. Set
+    # RUN_SCHEDULER_IN_API=true only for a single-process deployment that has
+    # no separate scheduler container.
+    run_scheduler = os.getenv("RUN_SCHEDULER_IN_API", "false").lower() == "true"
+    if run_scheduler:
+        try:
+            from app.scheduler.jobs import start_scheduler
+            start_scheduler()
+            logger.info("Scheduler started in-process (RUN_SCHEDULER_IN_API)")
+        except Exception as e:
+            logger.warning(f"Scheduler failed to start: {e}")
+    else:
+        logger.info("Scheduler not started here; the dedicated container owns it")
 
     yield
 
     # Shutdown
-    try:
-        from app.scheduler.jobs import stop_scheduler
-        stop_scheduler()
-    except Exception:
-        pass
+    if run_scheduler:
+        try:
+            from app.scheduler.jobs import stop_scheduler
+            stop_scheduler()
+        except Exception:
+            pass
     logger.info("BF1-2026 Quantitative System shut down")
 
 

@@ -42,9 +42,12 @@ async def leaderboard_command(
         for i, u in enumerate(users):
             medal = medals[i] if i < 3 else f"  {i + 1}\\."
             name = u.username or f"User {u.telegram_id}"
+            # Escaped for MarkdownV2 — an unescaped "." made /leaderboard fail
+            # with 400 as soon as there was at least one user to show.
+            points = escape_md(f"{u.total_points:.1f}")
             lines.append(
                 f"{medal} {escape_md(name)} \\| "
-                f"{u.total_points:.1f} pts \\| "
+                f"{points} pts \\| "
                 f"{u.total_bets} bets"
             )
 
