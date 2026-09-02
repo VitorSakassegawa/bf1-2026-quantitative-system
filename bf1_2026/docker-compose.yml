@@ -6,11 +6,13 @@ services:
     container_name: bf1_api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      # Bound to loopback only. nginx reaches the API over the compose network,
-      # so publishing 8000 on every host interface just exposed the whole API
-      # (including /api/v1/admin/*) directly to the internet, bypassing nginx.
-      # Use an SSH tunnel for local debugging.
-      - "127.0.0.1:8000:8000"
+      # API_BIND controls which interface the API is published on.
+      #   127.0.0.1  only this host (default; nginx still proxies it on :80)
+      #   0.0.0.0    every interface — correct for a LAN-only box such as a
+      #              Synology, where other devices on the network need it
+      # On an internet-facing host, leave it at the default: publishing 8000
+      # broadly exposes the whole API, /api/v1/admin/* included, past nginx.
+      - "${API_BIND:-127.0.0.1}:8000:8000"
     env_file:
       - .env
     depends_on:

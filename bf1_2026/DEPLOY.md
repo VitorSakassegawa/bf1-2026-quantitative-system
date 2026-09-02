@@ -36,17 +36,21 @@ treated as unconfigured: guarded routes return **503** and the reason is logged
 at boot. That is deliberate — it fails closed rather than accepting an empty
 header.
 
-### Running without API keys
+### LAN-only deployment (Synology and similar)
 
-If the deployment is genuinely unreachable from the internet — bound to
-loopback, or behind a private network or VPN — you can turn the guards off:
+This system is designed to run on your own hardware, on your own network. If
+nothing outside the LAN can reach it, the API keys are optional:
 
 ```bash
 REQUIRE_API_KEYS=false
+API_BIND=0.0.0.0          # so other devices on the network reach :8000
 ```
 
-Every write route and the whole admin surface is then open to anything that can
-reach the port, and the API says so at boot:
+`API_BIND=0.0.0.0` matters here: the default binds the API to loopback, which
+on a NAS means only the NAS itself can reach port 8000. Other machines on the
+network still get in through nginx on `:80` either way.
+
+With the guards off, the API announces it at boot:
 
 ```
 SECURITY: REQUIRE_API_KEYS=false — every write route and the entire admin
@@ -54,14 +58,13 @@ surface is UNAUTHENTICATED. Only valid if this port is truly unreachable
 from the internet
 ```
 
-**A public hostname does not qualify**, including a `*.ondigitalocean.app`
-URL — those are published to the internet by default. If the app answers on a
-public address, anyone who finds it can create races and drivers (which poisons
-the ELO grid the strategies are built from) and can pin the container's CPU
-through `/simulate`. Generating two keys takes about ten seconds and is the
-better trade unless you are certain the port is private.
+Two things to keep in mind. Anyone who can reach the port can create races and
+drivers — which poisons the ELO grid the strategies are derived from — so this
+assumes you trust every device on the network. And if you later expose the box
+(port forwarding, a reverse proxy, Synology QuickConnect, Tailscale Funnel),
+set `REQUIRE_API_KEYS=true` and generate the two keys at that point.
 
-A correct key still wins when one is set, so you can turn this off temporarily
+A correct key is still enforced when one is set, so the flag can be flipped
 without removing your keys.
 
 ---
