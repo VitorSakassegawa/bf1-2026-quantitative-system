@@ -215,24 +215,38 @@ container.
 
 ## Upgrading an existing install
 
-The database holds nothing that cannot be re-downloaded (results, ratings,
-KPIs) plus any bets recorded through the bot. The schema gained stable
-identifiers and per-result team attribution, and older installs created their
-tables without Alembic, so the clean path is to recreate it:
+One command, from the `bf1_2026/` directory on the server:
 
 ```bash
-git pull
+git pull                      # or copy the new files over
+sudo ./deploy/upgrade.sh
+```
+
+It checks `.env` and adds what this version needs — asking once for the
+bolão site's address and your login there — rebuilds the images, brings the
+database to the current schema, loads the data and runs the health check.
+
+About the database: one created by an older version has tables but no
+migration history, so it cannot be migrated and is recreated. The script tells
+you so and asks before doing it. Nothing is lost that is not downloaded again
+in about three minutes, except bets recorded through the bot. A database that
+already has a migration history is upgraded in place and keeps everything.
+
+`--yes` skips the question, `--fresh` recreates the database regardless,
+`--no-pool` skips the bolão login. The same script does a first install.
+
+The equivalent by hand:
+
+```bash
 docker compose down
 docker volume ls | grep postgres           # find the Postgres volume's name
-docker volume rm <that volume>             # drops the old database
-docker compose up -d --build               # rebuild: dependencies changed
+docker volume rm <that volume>             # only if the database must be recreated
+docker compose up -d --build
 docker exec bf1_api alembic upgrade head
 docker exec bf1_api python -m scripts.pipeline
 docker exec bf1_api python -m scripts.healthcheck
 ```
 
-Then add the `POOL_*` settings to `.env` (section 1) and restart the bot:
-`docker compose up -d bf1_bot`.
 
 What changes for you after the upgrade:
 

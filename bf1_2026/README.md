@@ -83,12 +83,11 @@ one time in ten.
 ## Installation
 
 ```bash
-cp .env.template .env            # then edit it — see DEPLOY.md
-docker compose up -d --build
-docker exec bf1_api alembic upgrade head
-docker exec bf1_api python -m scripts.pipeline
-docker exec bf1_api python -m scripts.healthcheck
+sudo ./deploy/upgrade.sh         # first install and every upgrade
 ```
+
+It writes `.env` (asking for what it cannot guess), builds the images,
+migrates the database, loads the data and runs the health check.
 
 `DEPLOY.md` has the full runbook, including the Synology / LAN-only setup and
 how to move an existing database to this version.
