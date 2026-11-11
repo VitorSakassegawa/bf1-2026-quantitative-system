@@ -42,8 +42,8 @@ HIGH_CONFIDENCE = 0.70
 EXTREME_DEGRADATION = 0.90
 DEFAULT_AVG_STOPS = 2.0
 
-# Points bounds: BF1 caps at 25 (win) + 1 (fastest lap); DNF is -10.
-MAX_RACE_POINTS = 26.0
+# Points bounds: 25 for a win (the pool has no fastest-lap bonus); DNF is -10.
+MAX_RACE_POINTS = 25.0
 SPRINT_POINTS_MULTIPLIER = 2.0
 
 # No single-race retirement is a certainty, and no race retires the whole

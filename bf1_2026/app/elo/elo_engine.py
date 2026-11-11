@@ -79,14 +79,17 @@ class ELOEngine:
         if current_elos is None:
             current_elos = {}
 
-        # Assign effective positions: DNF → P20
+        # Assign effective positions: a non-finisher ranks behind the whole
+        # field. This used to be a hard-coded P20, which on a 22-car grid put
+        # a retirement *ahead* of the classified P21 and P22.
+        last = max(20, len(results))
         effective = []
         for r in results:
             driver_id = r["driver_id"]
             dnf = r.get("dnf", False)
-            pos = r.get("final_position") or r.get("grid_position", 20)
+            pos = r.get("final_position") or r.get("grid_position", last)
             if dnf or pos is None:
-                pos = 20
+                pos = last
             elo = current_elos.get(driver_id, self.BASE_ELO)
             effective.append(
                 {"driver_id": driver_id, "position": pos, "elo": elo}
@@ -130,7 +133,7 @@ class ELOEngine:
                 "elo_delta": delta,
             }
 
-        logger.info(f"ELO updated for {len(updates)} drivers (K={k_factor})")
+        logger.debug(f"ELO updated for {len(updates)} drivers (K={k_factor})")
         return updates
 
     def update_team_elo(

@@ -1,70 +1,52 @@
-"""Validation utilities for BF1-2026 business rules."""
+"""Validation utilities for BF1-2026 business rules.
+
+The rules themselves live in ``app.rules.pool_rules`` (mirroring the pool's
+own published rules). The module-level constants here are kept as aliases so
+existing imports continue to work, but they are derived, not re-declared.
+"""
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
+from app.rules.pool_rules import DEFAULT_RULES, PoolRules, ResultLine
 
-BF1_TOTAL_TOKENS = 15
-BF1_MAX_TOKENS_PER_DRIVER = 5
-BF1_MIN_DRIVERS = 5
-BF1_MIN_DIFFERENT_TEAMS = 5
-BF1_DNF_PENALTY = -10
-BF1_SPRINT_MULTIPLIER = 2.0
-BF1_FASTEST_LAP_BONUS = 1
+BF1_TOTAL_TOKENS = DEFAULT_RULES.total_chips
+BF1_MAX_TOKENS_PER_DRIVER = DEFAULT_RULES.max_chips_per_driver
+BF1_MIN_DRIVERS = DEFAULT_RULES.minimum_drivers
+BF1_MIN_DIFFERENT_TEAMS = DEFAULT_RULES.minimum_drivers
+# Flat, per driver — NOT per chip. See pool_rules for why that matters.
+BF1_DNF_PENALTY = -int(DEFAULT_RULES.retirement_penalty)
+BF1_SPRINT_MULTIPLIER = DEFAULT_RULES.multiplier(sprint=True)
+BF1_ELEVENTH_BONUS = DEFAULT_RULES.eleventh_bonus
 
 BF1_POINTS_TABLE = {
-    1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
-    6: 8, 7: 6, 8: 4, 9: 2, 10: 1,
+    pos: pts for pos, pts in enumerate(DEFAULT_RULES.position_points, start=1)
 }
 
 
 def validate_allocation(
     allocations: dict[str, int],
     team_membership: dict[str, str],
+    rules: PoolRules | None = None,
 ) -> list[str]:
     """
     Validate a token allocation against all BF1-2026 rules.
     Returns a list of error messages (empty if valid).
     """
-    errors: list[str] = []
-
-    total_tokens = sum(allocations.values())
-    if total_tokens != BF1_TOTAL_TOKENS:
-        errors.append(f"Total tokens must be {BF1_TOTAL_TOKENS}, got {total_tokens}")
-
-    for driver_id, tokens in allocations.items():
-        if tokens < 1:
-            errors.append(f"Driver {driver_id}: minimum 1 token, got {tokens}")
-        if tokens > BF1_MAX_TOKENS_PER_DRIVER:
-            errors.append(
-                f"Driver {driver_id}: maximum {BF1_MAX_TOKENS_PER_DRIVER} tokens, got {tokens}"
-            )
-
-    if len(allocations) < BF1_MIN_DRIVERS:
-        errors.append(
-            f"Must select at least {BF1_MIN_DRIVERS} drivers, got {len(allocations)}"
-        )
-
-    teams_used = set()
-    for driver_id in allocations:
-        team = team_membership.get(driver_id)
-        if team:
-            teams_used.add(team)
-    if len(teams_used) < BF1_MIN_DIFFERENT_TEAMS:
-        errors.append(
-            f"Must use at least {BF1_MIN_DIFFERENT_TEAMS} different teams, got {len(teams_used)}"
-        )
-
-    return errors
+    return (rules or DEFAULT_RULES).validate(allocations, team_membership)
 
 
 def bet_deadline_for(race_date: datetime, deadline_bets: datetime | None = None) -> datetime:
-    """The instant betting closes: the stored deadline, else 1h before lights out."""
+    """The instant betting closes.
+
+    The pool accepts bets "até o horário oficial da prova", i.e. until the
+    scheduled start — not an hour before, which is what this used to assume.
+    A stored deadline (synced from the pool's own calendar) always wins.
+    """
     if deadline_bets is not None:
         return _as_utc(deadline_bets)
-    return _as_utc(race_date) - timedelta(hours=1)
+    return _as_utc(race_date)
 
 
 def is_bet_deadline_passed(
@@ -77,8 +59,7 @@ def is_bet_deadline_passed(
     the deadline from `race_date` alone is only safe if `race_date` is the real
     session start: seeded races used to carry a placeholder 14:00 UTC, so for
     an early race (Melbourne starts 04:00 UTC) the derived deadline landed
-    ~9 hours *after* the chequered flag and bets could still be placed on a
-    race whose result was already public.
+    hours *after* the chequered flag.
 
     Naive datetimes are treated as UTC rather than compared against an aware
     `now`, which would raise TypeError.
@@ -92,13 +73,18 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def calculate_bf1_points(position: int | None, dnf: bool, fastest_lap: bool) -> float:
-    """Calculate BF1 points for a given result."""
-    if dnf:
-        return float(BF1_DNF_PENALTY)
-    if position is None:
-        return 0.0
-    points = float(BF1_POINTS_TABLE.get(position, 0))
-    if fastest_lap and position is not None and position <= 10:
-        points += BF1_FASTEST_LAP_BONUS
-    return points
+def calculate_bf1_points(
+    position: int | None,
+    dnf: bool,
+    chips: int = 1,
+    sprint: bool = False,
+    rules: PoolRules | None = None,
+) -> float:
+    """Points one driver contributes to a bet: chips x points, or a flat penalty.
+
+    The old signature took a ``fastest_lap`` flag and added a bonus point. The
+    pool has no fastest-lap bonus (and F1 itself dropped the point in 2025).
+    """
+    rules = rules or DEFAULT_RULES
+    line = ResultLine(position=None if dnf else position, retired=dnf)
+    return rules.score({"d": chips}, None, {"d": line}, sprint=sprint).total

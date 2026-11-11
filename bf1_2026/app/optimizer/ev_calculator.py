@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
-from app.utils.validators import BF1_SPRINT_MULTIPLIER
+from app.rules.pool_rules import DEFAULT_RULES, PoolRules
 
 
 class EVCalculator:
-    """Calculate expected values for driver–token allocations."""
+    """Expected value of chips on a driver, under the pool's formula.
 
-    # Sourced from the rules module rather than re-declared, so the engine and
-    # the spec cannot drift apart.
-    SPRINT_MULTIPLIER = BF1_SPRINT_MULTIPLIER
+        score = chips x driver points + 11th bonus - retirement penalties
+
+    CONTRACT: ``prediction["expected_points"]`` is the expected *position
+    points* for the session (zero when the driver is not classified). It does
+    not include the retirement penalty or the sprint doubling — both are
+    applied here.
+
+    The retirement penalty is a **flat** amount per selected driver. Earlier
+    versions folded it into the per-chip expectation, which charged a 5-chip
+    pick five times over; that is why the old optimiser spread chips thin and
+    scored ~700 points worse over the 2026 season than its own most
+    concentrated profile.
+    """
+
+    def __init__(self, rules: PoolRules = DEFAULT_RULES) -> None:
+        self.rules = rules
+
+    @property
+    def SPRINT_MULTIPLIER(self) -> float:  # noqa: N802 (kept for compatibility)
+        return self.rules.multiplier(sprint=True)
+
+    @staticmethod
+    def _retire_probability(prediction: dict) -> float:
+        if "retire_probability" in prediction:
+            return float(prediction["retire_probability"])
+        return float(prediction.get("dnf_probability", 0.0))
 
     def calculate_driver_ev(
         self,
@@ -18,29 +41,14 @@ class EVCalculator:
         tokens: int,
         is_sprint: bool = False,
     ) -> float:
-        """Expected Value for a single driver with N tokens.
-
-            EV = tokens * expected_points * sprint_multiplier
-
-        CONTRACT: `prediction["expected_points"]` is the *unconditional*
-        expected BF1 points for the session — it already integrates over
-        finishing positions and already carries BF1_DNF_PENALTY for the
-        retirement mass. It is NOT pre-scaled by the sprint multiplier; that
-        is applied here, in exactly one place.
-
-        The previous formula multiplied that expectation by `top10_probability`
-        and then subtracted `dnf_prob * 10` on top, double-charging retirements
-        and re-applying a scoring probability already baked into the value. The
-        error scaled with each driver's own probabilities, so it distorted the
-        *ranking*, not just the magnitude: midfielders came out at ~0.25x their
-        true EV and backmarkers went negative, which pushed the optimizer off
-        the drivers the team-diversity rule forces it to pick.
-        """
-        expected_pts = prediction.get("expected_points", 0.0)
-        sprint_mult = self.SPRINT_MULTIPLIER if is_sprint else 1.0
-
-        ev = tokens * expected_pts * sprint_mult
-        return round(ev, 4)
+        """EV of ``tokens`` chips on one driver (0 when the driver is not picked)."""
+        if tokens <= 0:
+            return 0.0
+        points = float(prediction.get("expected_points", 0.0))
+        ev = tokens * points - self.rules.retirement_penalty * self._retire_probability(
+            prediction
+        )
+        return round(ev * self.rules.multiplier(is_sprint), 4)
 
     def calculate_portfolio_ev(
         self,
@@ -48,35 +56,9 @@ class EVCalculator:
         predictions: dict[str, dict],
         is_sprint: bool = False,
     ) -> float:
-        """Total portfolio EV = sum of individual driver EVs."""
-        total = 0.0
-        for driver_id, tokens in allocation.items():
-            pred = predictions.get(driver_id, {})
-            total += self.calculate_driver_ev(pred, tokens, is_sprint)
+        """Expected chip score of a whole bet (11th-place bonus not included)."""
+        total = sum(
+            self.calculate_driver_ev(predictions.get(driver_id, {}), tokens, is_sprint)
+            for driver_id, tokens in allocation.items()
+        )
         return round(total, 4)
-
-    def calculate_correlation_penalty(
-        self,
-        allocation: dict[str, int],
-        team_membership: dict[str, str],
-    ) -> float:
-        """
-        Penalization for correlated team bets.
-        If 2 drivers from the same team have high tokens:
-        penalty = tokens_p1 * tokens_p2 * 0.1
-        """
-        # Group drivers by team
-        teams: dict[str, list[tuple[str, int]]] = {}
-        for did, tokens in allocation.items():
-            team = team_membership.get(did, "unknown")
-            teams.setdefault(team, []).append((did, tokens))
-
-        penalty = 0.0
-        for team_id, members in teams.items():
-            if len(members) >= 2:
-                # All pairs
-                for i in range(len(members)):
-                    for j in range(i + 1, len(members)):
-                        penalty += members[i][1] * members[j][1] * 0.1
-
-        return round(penalty, 4)

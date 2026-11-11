@@ -1,42 +1,58 @@
-"""Token optimizer – optimal allocation of 15 BF1 tokens under constraints."""
+"""Token optimizer – allocation of the 15 BF1 chips under the pool's rules."""
 
 from __future__ import annotations
 
-import itertools
-from collections import defaultdict
-
-import numpy as np
 from loguru import logger
 
+from app.models_ml.race_model import SimulationResult
 from app.optimizer.ev_calculator import EVCalculator
-from app.utils.validators import (
-    BF1_MAX_TOKENS_PER_DRIVER,
-    BF1_MIN_DIFFERENT_TEAMS,
-    BF1_MIN_DRIVERS,
-    BF1_TOTAL_TOKENS,
-    validate_allocation,
+from app.optimizer.pool_optimizer import (
+    RISK_PROFILES,
+    exact_ev_allocation,
+    optimize_allocation,
 )
+from app.rules.pool_rules import DEFAULT_RULES, PoolRules
 
 
 class TokenOptimizer:
     """
-    Optimize the allocation of 15 BF1 tokens across drivers.
+    Choose who gets the chips.
 
-    Hard constraints:
-    - Total tokens = 15
-    - Max 5 per driver
-    - Min 1 per selected driver
-    - At least 5 drivers from different teams
-    - At least 5 drivers total
+    Rules enforced (from the pool's own rule set):
+    - 15 chips in total, at most 5 on one driver, at least 1 on each pick
+    - at least 5 drivers, and never two from the same team
+
+    The search is exact for expected value (see ``pool_optimizer``). The four
+    strategy names are risk postures around that optimum:
+
+    - ``balanced``          maximum expected score — the default, and the
+                            right choice over a whole season
+    - ``conservative``      gives up a little expectation for a tighter range
+    - ``aggressive`` /
+      ``ultra_aggressive``  prefer a wider range, for chasing a gap late on
+
+    Risk postures need the full simulation; given only per-driver summaries
+    every strategy falls back to the expected-value optimum.
     """
 
-    TOTAL_TOKENS = BF1_TOTAL_TOKENS
-    MAX_PER_DRIVER = BF1_MAX_TOKENS_PER_DRIVER
-    MIN_TEAMS = BF1_MIN_DIFFERENT_TEAMS
-    MIN_DRIVERS = BF1_MIN_DRIVERS
+    def __init__(self, rules: PoolRules = DEFAULT_RULES) -> None:
+        self.rules = rules
+        self.ev_calc = EVCalculator(rules)
 
-    def __init__(self) -> None:
-        self.ev_calc = EVCalculator()
+    # Kept as attributes because callers and tests read them.
+    @property
+    def TOTAL_TOKENS(self) -> int:  # noqa: N802
+        return self.rules.total_chips
+
+    @property
+    def MAX_PER_DRIVER(self) -> int:  # noqa: N802
+        return self.rules.max_chips_per_driver
+
+    @property
+    def MIN_DRIVERS(self) -> int:  # noqa: N802
+        return self.rules.minimum_drivers
+
+    MIN_TEAMS = DEFAULT_RULES.minimum_drivers
 
     def optimize(
         self,
@@ -44,264 +60,73 @@ class TokenOptimizer:
         team_membership: dict[str, str],
         strategy_type: str = "balanced",
         is_sprint: bool = False,
+        simulation: SimulationResult | None = None,
     ) -> dict:
-        """
-        Return optimal allocation: {driver_id: tokens}.
-
-        Strategies:
-        - conservative: uniform distribution, prioritizes consistency
-        - balanced: maximize EV with diversification
-        - aggressive: concentrate tokens on top EVs
-        - ultra_aggressive: maximum concentration (5-4-3-2-1)
-        """
-        if not predictions:
+        """Return the allocation and what to expect from it."""
+        if not predictions and simulation is None:
             return {}
 
-        # Rank drivers by expected value
-        ranked = self._rank_by_ev(predictions, team_membership, is_sprint)
+        risk = RISK_PROFILES.get(strategy_type, 0.0)
+        extra: dict = {}
 
-        if strategy_type == "conservative":
-            allocation = self._conservative_allocation(ranked, team_membership)
-        elif strategy_type == "aggressive":
-            allocation = self._aggressive_allocation(ranked, team_membership)
-        elif strategy_type == "ultra_aggressive":
-            allocation = self._ultra_aggressive_allocation(ranked, team_membership)
-        else:  # balanced
-            allocation = self._balanced_allocation(ranked, team_membership)
+        if simulation is not None:
+            result = optimize_allocation(simulation, team_membership, self.rules, risk)
+            allocation, errors = result.allocation, result.errors
+            total_ev = result.expected_score
+            extra = {
+                "std": round(result.std, 2),
+                "p10": round(result.p10, 1),
+                "p50": round(result.p50, 1),
+                "p90": round(result.p90, 1),
+                "eleventh_pick": result.eleventh_pick,
+                "eleventh_probability": round(result.eleventh_probability, 4),
+                "eleventh_candidates": result.eleventh_candidates,
+                "expected_total": round(result.expected_total, 2),
+            }
+        else:
+            ids = list(predictions)
+            picks = exact_ev_allocation(
+                ids,
+                [float(predictions[d].get("expected_points", 0.0)) for d in ids],
+                [EVCalculator._retire_probability(predictions[d]) for d in ids],
+                team_membership,
+                self.rules,
+            )
+            if picks is None:
+                teams = {team_membership.get(d) for d in ids if team_membership.get(d)}
+                allocation = {}
+                errors = [
+                    f"No valid allocation: the rules need {self.rules.minimum_drivers} "
+                    f"drivers from different teams and only {len(teams)} team(s) "
+                    "are available."
+                ]
+            else:
+                allocation = {ids[i]: c for i, c in sorted(picks.items(), key=lambda kv: -kv[1])}
+                errors = self.rules.validate(allocation, team_membership)
+            total_ev = self.ev_calc.calculate_portfolio_ev(allocation, predictions, is_sprint)
 
-        # Validate. The fallback re-runs the same diversity selection, so if
-        # the input itself cannot satisfy the rules (missing team_membership,
-        # too few active drivers) it will fail identically — surface that
-        # instead of silently returning an invalid strategy.
-        errors = validate_allocation(allocation, team_membership)
         if errors:
-            logger.warning(f"Allocation constraint violations: {errors}")
-            allocation = self._fallback_allocation(ranked, team_membership)
-            errors = validate_allocation(allocation, team_membership)
-            if errors:
-                logger.error(
-                    f"Fallback allocation still violates BF1 rules: {errors}. "
-                    "Check that team_membership is populated and that enough "
-                    "drivers are active."
-                )
-
-        total_ev = self.ev_calc.calculate_portfolio_ev(
-            allocation, predictions, is_sprint
-        )
-        corr_penalty = self.ev_calc.calculate_correlation_penalty(
-            allocation, team_membership
-        )
-
-        logger.info(
-            f"Optimized allocation ({strategy_type}): "
-            f"EV={total_ev:.2f}, penalty={corr_penalty:.2f}, "
-            f"drivers={len(allocation)}"
-        )
+            logger.error(
+                f"Allocation violates BF1 rules: {errors}. Check that "
+                "team_membership is populated and that enough drivers are active."
+            )
+        else:
+            logger.info(
+                f"Optimized allocation ({strategy_type}): EV={total_ev:.2f}, "
+                f"drivers={len(allocation)}"
+            )
 
         return {
             "allocation": allocation,
-            # EV net of the team-correlation penalty, which was previously
-            # computed and then discarded — reported next to total_ev as if it
-            # had been accounted for, but never actually subtracted.
-            "total_ev": round(total_ev - corr_penalty, 4),
-            "gross_ev": total_ev,
-            "correlation_penalty": corr_penalty,
+            "total_ev": round(total_ev, 4),
             "strategy_type": strategy_type,
+            "risk_aversion": risk,
             "constraint_errors": errors,
+            **extra,
         }
-
-    def _rank_by_ev(
-        self,
-        predictions: dict[str, dict],
-        team_membership: dict[str, str],
-        is_sprint: bool,
-    ) -> list[tuple[str, float, dict]]:
-        """Rank drivers by single-token EV."""
-        evs = []
-        for did, pred in predictions.items():
-            ev = self.ev_calc.calculate_driver_ev(pred, 1, is_sprint)
-            evs.append((did, ev, pred))
-        evs.sort(key=lambda x: x[1], reverse=True)
-        return evs
-
-    def _ensure_team_diversity(
-        self,
-        candidates: list[tuple[str, float, dict]],
-        team_membership: dict[str, str],
-        min_drivers: int = 5,
-    ) -> list[str]:
-        """Select at least min_drivers from different teams.
-
-        A driver with no known team must NOT be counted as a team of its own:
-        `validate_allocation` skips falsy teams, so inventing `unknown_<id>`
-        here made the two disagree, and an allocation covering zero real teams
-        would satisfy this method while failing validation.
-        """
-        selected: list[str] = []
-        teams_used: set[str] = set()
-
-        for did, ev, pred in candidates:
-            team = team_membership.get(did)
-            if not team:
-                continue
-            if team not in teams_used:
-                selected.append(did)
-                teams_used.add(team)
-            if len(teams_used) >= self.MIN_TEAMS and len(selected) >= min_drivers:
-                break
-
-        # If we need more drivers
-        for did, ev, pred in candidates:
-            if did not in selected:
-                selected.append(did)
-            if len(selected) >= min_drivers:
-                break
-
-        return selected
-
-    def _conservative_allocation(
-        self, ranked: list, team_membership: dict
-    ) -> dict[str, int]:
-        """Distribute tokens uniformly across more drivers."""
-        drivers = self._ensure_team_diversity(ranked, team_membership, min_drivers=7)
-
-        # Even split: 15 tokens / 7-8 drivers
-        n = min(len(drivers), 8)
-        drivers = drivers[:n]
-        base = self.TOTAL_TOKENS // n
-        remainder = self.TOTAL_TOKENS % n
-
-        allocation = {}
-        for i, did in enumerate(drivers):
-            tokens = base + (1 if i < remainder else 0)
-            allocation[did] = min(tokens, self.MAX_PER_DRIVER)
-
-        return self._fix_total(allocation)
-
-    def _balanced_allocation(
-        self, ranked: list, team_membership: dict
-    ) -> dict[str, int]:
-        """Balance EV maximization with diversification."""
-        drivers = self._ensure_team_diversity(ranked, team_membership, min_drivers=6)
-        drivers = drivers[:6]
-
-        # Weight by EV rank: [4, 3, 3, 2, 2, 1]
-        weights = [4, 3, 3, 2, 2, 1]
-        allocation = {}
-        for i, did in enumerate(drivers):
-            if i < len(weights):
-                allocation[did] = min(weights[i], self.MAX_PER_DRIVER)
-
-        return self._fix_total(allocation)
-
-    def _aggressive_allocation(
-        self, ranked: list, team_membership: dict
-    ) -> dict[str, int]:
-        """Concentrate tokens on top EV drivers."""
-        drivers = self._ensure_team_diversity(ranked, team_membership, min_drivers=5)
-        drivers = drivers[:5]
-
-        # Concentrated: [5, 4, 3, 2, 1]
-        weights = [5, 4, 3, 2, 1]
-        allocation = {}
-        for i, did in enumerate(drivers):
-            if i < len(weights):
-                allocation[did] = min(weights[i], self.MAX_PER_DRIVER)
-
-        return self._fix_total(allocation)
-
-    def _ultra_aggressive_allocation(
-        self, ranked: list, team_membership: dict
-    ) -> dict[str, int]:
-        """Maximum concentration on top performers."""
-        drivers = self._ensure_team_diversity(ranked, team_membership, min_drivers=5)
-        drivers = drivers[:5]
-
-        # Check EV gap
-        if len(ranked) >= 2:
-            ev1 = ranked[0][1]
-            ev2 = ranked[1][1]
-            gap = (ev1 - ev2) / abs(ev2) if ev2 != 0 else 0
-
-            if gap > 0.2:
-                # Ultra concentration
-                weights = [5, 4, 3, 2, 1]
-            else:
-                weights = [5, 4, 3, 2, 1]
-        else:
-            weights = [5, 4, 3, 2, 1]
-
-        allocation = {}
-        for i, did in enumerate(drivers):
-            if i < len(weights):
-                allocation[did] = min(weights[i], self.MAX_PER_DRIVER)
-
-        return self._fix_total(allocation)
-
-    def _fallback_allocation(
-        self, ranked: list, team_membership: dict
-    ) -> dict[str, int]:
-        """Safe fallback allocation that always passes constraints."""
-        drivers = self._ensure_team_diversity(ranked, team_membership, min_drivers=5)
-        drivers = drivers[:5]
-        allocation = {did: 3 for did in drivers}
-        return self._fix_total(allocation)
-
-    def _fix_total(self, allocation: dict[str, int]) -> dict[str, int]:
-        """Ensure the total is exactly TOTAL_TOKENS, or give up cleanly.
-
-        Both loops used to spin forever whenever a full pass could make no
-        progress — e.g. every selected driver already at MAX_PER_DRIVER while
-        the total was still short (reachable with fewer than 3 active drivers
-        in the DB), or every driver at 1 token while the total was still over.
-        That was an un-loggable 100% CPU spin holding the event loop, not an
-        exception, so nothing restarted the container.
-
-        Each pass now has to change something; if it cannot, the allocation is
-        infeasible and we stop and report it rather than hang.
-        """
-        total = sum(allocation.values())
-        drivers = list(allocation.keys())
-
-        while total < self.TOTAL_TOKENS and drivers:
-            progressed = False
-            for did in drivers:
-                if allocation[did] < self.MAX_PER_DRIVER:
-                    allocation[did] += 1
-                    total += 1
-                    progressed = True
-                if total >= self.TOTAL_TOKENS:
-                    break
-            if not progressed:
-                logger.warning(
-                    f"Cannot reach {self.TOTAL_TOKENS} tokens: {len(drivers)} "
-                    f"driver(s) all at the {self.MAX_PER_DRIVER}-token cap "
-                    f"(total={total}). Need at least "
-                    f"{-(-self.TOTAL_TOKENS // self.MAX_PER_DRIVER)} drivers."
-                )
-                break
-
-        while total > self.TOTAL_TOKENS and drivers:
-            progressed = False
-            for did in reversed(drivers):
-                if allocation[did] > 1:
-                    allocation[did] -= 1
-                    total -= 1
-                    progressed = True
-                if total <= self.TOTAL_TOKENS:
-                    break
-            if not progressed:
-                logger.warning(
-                    f"Cannot reduce to {self.TOTAL_TOKENS} tokens: "
-                    f"{len(drivers)} driver(s) all at the 1-token floor "
-                    f"(total={total})."
-                )
-                break
-
-        return allocation
 
     def check_constraints(
         self, allocation: dict[str, int], team_membership: dict[str, str]
     ) -> list[str]:
-        """Public wrapper around validate_allocation."""
-        return validate_allocation(allocation, team_membership)
+        """Every rule the allocation breaks (empty when valid)."""
+        return self.rules.validate(allocation, team_membership)

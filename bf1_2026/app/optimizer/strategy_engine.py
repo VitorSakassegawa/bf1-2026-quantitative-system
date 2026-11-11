@@ -1,208 +1,166 @@
-"""Strategy engine – orchestrates the full prediction-to-allocation pipeline."""
+"""Strategy engine – from a grid to a bet.
+
+    drivers (grid, form, rating, reliability)
+        -> race simulation            (race_model, calibrated on real results)
+        -> chip allocation            (pool_optimizer, exact under the pool rules)
+        -> 11th-place pick            (most probable P11 in the simulation)
+
+The XGBoost model is deliberately no longer on this path. It was never trained
+on point-in-time features (its training set had look-ahead and ten constant
+columns), and a walk-forward backtest showed the starting grid already carries
+almost all of the predictive signal. Predictions here come from the simulator
+alone, whose every parameter was fitted and checked out-of-sample.
+"""
 
 from __future__ import annotations
 
 from loguru import logger
 
-from app.kpis.circuit_kpis import CircuitKPICalculator
-from app.kpis.derived_kpis import DerivedKPICalculator
-from app.kpis.driver_kpis import DriverKPICalculator
-from app.kpis.team_kpis import TeamKPICalculator
 from app.models_ml.monte_carlo import MonteCarloSimulator, SimulationConfig
-from app.models_ml.xgboost_model import XGBoostF1Model
+from app.models_ml.race_model import DEFAULT_PARAMS, ModelParams
 from app.optimizer.ev_calculator import EVCalculator
 from app.optimizer.token_optimizer import TokenOptimizer
+from app.rules.pool_rules import DEFAULT_RULES, PoolRules
 from app.utils.guardrails import PitStopProjector, validate_prediction
-from app.utils.validators import BF1_DNF_PENALTY
-
-
-def _net_expected_points(scoring_points: float, dnf_prob: float) -> float:
-    """Fold the retirement branch into a raw scoring-points estimate.
-
-    Returns the unconditional expectation E[points] = P(finish)*points +
-    P(dnf)*penalty, which is the form EVCalculator expects.
-    """
-    p_dnf = min(max(float(dnf_prob), 0.0), 1.0)
-    return (1.0 - p_dnf) * float(scoring_points) + p_dnf * float(BF1_DNF_PENALTY)
 
 
 class StrategyEngine:
-    """
-    Main strategy orchestrator.
-    Combines: KPIs + ML + Monte Carlo + Optimisation + BF1 Rules.
-    """
+    """Simulate a session and recommend a bet for it."""
 
-    def __init__(self) -> None:
-        self.circuit_kpi_calc = CircuitKPICalculator()
-        self.driver_kpi_calc = DriverKPICalculator()
-        self.team_kpi_calc = TeamKPICalculator()
-        self.derived_kpi_calc = DerivedKPICalculator()
-        self.xgb_model = XGBoostF1Model()
-        self.mc_simulator = MonteCarloSimulator()
-        self.ev_calc = EVCalculator()
-        self.optimizer = TokenOptimizer()
+    def __init__(
+        self,
+        rules: PoolRules = DEFAULT_RULES,
+        params: ModelParams = DEFAULT_PARAMS,
+    ) -> None:
+        self.rules = rules
+        self.params = params
+        self.mc_simulator = MonteCarloSimulator(rules)
+        self.ev_calc = EVCalculator(rules)
+        self.optimizer = TokenOptimizer(rules)
         self.pit_projector = PitStopProjector()
 
     def generate_strategy(
         self,
         drivers: list[dict],
-        circuit_kpis: dict,
-        weather: dict,
+        circuit_kpis: dict | None,
+        weather: dict | None,
         team_membership: dict[str, str],
         user_aggressiveness: str = "balanced",
         is_sprint: bool = False,
         n_simulations: int = 20000,
         is_sprint_weekend: bool | None = None,
         confidence: float = 0.6,
+        seed: int = 42,
     ) -> dict:
         """
-        Full strategy pipeline:
-        1. Build feature matrix from KPIs
-        2. XGBoost predictions
-        3. Monte Carlo simulations
-        4. Calculate EVs
-        5. Optimize token allocation
-        6. Return complete strategy with justification
+        Build the recommended bet for one session.
+
+        ``drivers`` items: driver_id, team_id, name, code, grid_position
+        (None before qualifying), elo, and optionally form / dnf_probability
+        (see ``race_model.FormBook``).
+
+        ``is_sprint`` means the session being bet on *is* the sprint; it
+        selects the sprint points table and the doubled score.
+        ``is_sprint_weekend`` only informs the pit-stop projection.
         """
+        circuit_kpis = circuit_kpis or {}
+        weather = weather or {}
         logger.info(
             f"Generating strategy: {len(drivers)} drivers, "
-            f"aggressiveness={user_aggressiveness}"
+            f"profile={user_aggressiveness}, sprint={is_sprint}"
         )
 
-        # Step 1-2: XGBoost predictions
-        xgb_predictions = {}
-        try:
-            race_data = {"drivers": drivers, "is_sprint": is_sprint}
-            driver_kpis = {d["driver_id"]: d.get("kpis", {}) for d in drivers}
-            team_kpis_map = {d.get("team_id", ""): d.get("team_kpis", {}) for d in drivers}
-
-            X = self.xgb_model.build_feature_matrix(
-                race_data, driver_kpis, team_kpis_map, circuit_kpis, weather
+        predictions = self.mc_simulator.simulate_race(
+            drivers,
+            circuit_kpis,
+            weather,
+            SimulationConfig(
+                n_simulations=n_simulations, random_seed=seed, params=self.params
+            ),
+            is_sprint,
+        )
+        sim = self.mc_simulator.last_simulation
+        predictions = {
+            did: validate_prediction(
+                pred, grid_size=len(drivers), is_sprint=is_sprint, context=f"strategy:{did}"
             )
-            preds = self.xgb_model.predict(X)
-            for i, driver in enumerate(drivers):
-                xgb_predictions[driver["driver_id"]] = preds[i]
-        except Exception as e:
-            logger.warning(f"XGBoost prediction failed, using defaults: {e}")
-            for d in drivers:
-                xgb_predictions[d["driver_id"]] = {
-                    "expected_position": d.get("grid_position", 10),
-                    "top3_probability": 0.15,
-                    "top10_probability": 0.50,
-                    "dnf_probability": 0.05,
-                    "expected_points": 2.0,
-                }
+            for did, pred in predictions.items()
+        }
 
-        # Step 3: Monte Carlo simulation
-        mc_results = {}
-        try:
-            mc_drivers = []
-            for d in drivers:
-                pred = xgb_predictions.get(d["driver_id"], {})
-                mc_drivers.append({
-                    "driver_id": d["driver_id"],
-                    "grid_position": d.get("grid_position", 10),
-                    "dnf_probability": pred.get("dnf_probability", 0.05),
-                    "elo": d.get("elo", 1500),
-                    "wet_performance": d.get("kpis", {}).get("wet_performance", 0.0),
-                    "team_reliability": d.get("team_kpis", {}).get(
-                        "mechanical_reliability", 0.95
-                    ),
-                })
-
-            config = SimulationConfig(n_simulations=n_simulations)
-            mc_results = self.mc_simulator.simulate_race(
-                mc_drivers, circuit_kpis, weather, config, is_sprint
-            )
-        except Exception as e:
-            logger.warning(f"Monte Carlo failed: {e}")
-
-        # Step 4: Merge predictions – prefer MC where available
-        merged_predictions: dict[str, dict] = {}
-        for did, xgb_pred in xgb_predictions.items():
-            mc_pred = mc_results.get(did, {})
-            merged_predictions[did] = {
-                "expected_position": mc_pred.get(
-                    "avg_position", xgb_pred.get("expected_position", 10)
-                ),
-                "top3_probability": mc_pred.get(
-                    "top3_probability", xgb_pred.get("top3_probability", 0.15)
-                ),
-                "top10_probability": mc_pred.get(
-                    "top10_probability", xgb_pred.get("top10_probability", 0.5)
-                ),
-                "dnf_probability": mc_pred.get(
-                    "dnf_probability_simulated",
-                    xgb_pred.get("dnf_probability", 0.05),
-                ),
-                # Must be the unconditional E[points] (DNF penalty included,
-                # sprint multiplier NOT applied) — see EVCalculator's contract.
-                # Monte Carlo already reports it in that form; the XGBoost
-                # fallback reports raw scoring points, so net it here rather
-                # than letting two different quantities share one key.
-                "expected_points": mc_pred.get(
-                    "expected_bf1_points",
-                    _net_expected_points(
-                        xgb_pred.get("expected_points", 2.0),
-                        xgb_pred.get("dnf_probability", 0.05),
-                    ),
-                ),
-                "expected_value": mc_pred.get("expected_value", 0),
-            }
-            # Guardrail: clamp any out-of-domain field before it influences EV.
-            merged_predictions[did] = validate_prediction(
-                merged_predictions[did],
-                grid_size=len(drivers),
-                is_sprint=is_sprint,
-                context=f"strategy:{did}",
-            )
-
-        # Step 5: Optimize allocation
-        opt_result = self.optimizer.optimize(
-            merged_predictions,
+        opt = self.optimizer.optimize(
+            predictions,
             team_membership,
             strategy_type=user_aggressiveness,
             is_sprint=is_sprint,
+            simulation=sim,
+        )
+        allocation: dict[str, int] = opt.get("allocation", {})
+        info = {d["driver_id"]: d for d in drivers}
+
+        def describe(did: str) -> dict:
+            d = info.get(did, {})
+            return {
+                "driver_id": did,
+                "driver_name": d.get("name", "Unknown"),
+                "driver_code": d.get("code", "???"),
+                "team_id": d.get("team_id"),
+                "team_name": d.get("team_name"),
+            }
+
+        def chip_ev(did: str) -> float:
+            return self.ev_calc.calculate_driver_ev(
+                predictions.get(did, {}), allocation[did], is_sprint
+            )
+
+        driver_details = []
+        # Most chips first; among equals, the one worth more.
+        for did, tokens in sorted(
+            allocation.items(), key=lambda kv: (-kv[1], -chip_ev(kv[0]))
+        ):
+            pred = predictions.get(did, {})
+            driver_details.append(
+                {
+                    **describe(did),
+                    "tokens": tokens,
+                    "grid_position": info.get(did, {}).get("grid_position"),
+                    "expected_value": self.ev_calc.calculate_driver_ev(pred, tokens, is_sprint),
+                    "expected_points": pred.get("expected_points", 0.0),
+                    "win_probability": pred.get("win_probability", 0.0),
+                    "top3_probability": pred.get("top3_probability", 0.0),
+                    "top10_probability": pred.get("top10_probability", 0.0),
+                    "dnf_probability": pred.get("dnf_probability", 0.0),
+                    "expected_position": pred.get("expected_position", 10),
+                }
+            )
+
+        # The whole field in predicted finishing order, for display.
+        field_view = sorted(
+            (
+                {
+                    **describe(did),
+                    "grid_position": info.get(did, {}).get("grid_position"),
+                    "expected_position": pred.get("expected_position"),
+                    "expected_points": pred.get("expected_points", 0.0),
+                    "win_probability": pred.get("win_probability", 0.0),
+                    "top3_probability": pred.get("top3_probability", 0.0),
+                    "top10_probability": pred.get("top10_probability", 0.0),
+                    "eleventh_probability": pred.get("eleventh_probability", 0.0),
+                    "dnf_probability": pred.get("dnf_probability", 0.0),
+                }
+                for did, pred in predictions.items()
+            ),
+            key=lambda d: d["expected_position"] or 99,
         )
 
-        # Adjust for extreme weather
-        weather_risk = weather.get("weather_risk_index", 0.0)
-        if weather_risk > 0.6 and user_aggressiveness != "conservative":
-            logger.info("High weather risk – switching to conservative")
-            opt_result = self.optimizer.optimize(
-                merged_predictions,
-                team_membership,
-                strategy_type="conservative",
-                is_sprint=is_sprint,
-            )
-            opt_result["weather_adjusted"] = True
+        eleventh_candidates = [
+            {**describe(did), "probability": round(p, 4)}
+            for did, p in opt.get("eleventh_candidates", [])
+        ]
+        eleventh_pick = eleventh_candidates[0] if eleventh_candidates else None
 
-        # Step 6: Build strategy report data
-        allocation = opt_result.get("allocation", {})
-        driver_details = []
-        for did, tokens in sorted(
-            allocation.items(), key=lambda x: x[1], reverse=True
-        ):
-            pred = merged_predictions.get(did, {})
-            driver_info = next((d for d in drivers if d["driver_id"] == did), {})
-            driver_details.append({
-                "driver_id": did,
-                "driver_name": driver_info.get("name", "Unknown"),
-                "driver_code": driver_info.get("code", "???"),
-                "tokens": tokens,
-                "expected_value": self.ev_calc.calculate_driver_ev(
-                    pred, tokens, is_sprint
-                ),
-                "top3_probability": pred.get("top3_probability", 0),
-                "top10_probability": pred.get("top10_probability", 0),
-                "dnf_probability": pred.get("dnf_probability", 0),
-                "expected_position": pred.get("expected_position", 10),
-            })
-
-        # Bounded pit-stop projection (never emits a physically impossible count).
         if is_sprint_weekend is None:
             is_sprint_weekend = is_sprint
-        pit_projection = self.pit_projector.project(
+        pit = self.pit_projector.project(
             tire_degradation=circuit_kpis.get("avg_tire_degradation"),
             historical_avg_stops=circuit_kpis.get("avg_pit_stops"),
             confidence=confidence,
@@ -210,117 +168,123 @@ class StrategyEngine:
             is_sprint_race=is_sprint,
         )
 
+        grid_provisional = bool(sim.grid_provisional) if sim is not None else False
         insights = self._generate_insights(
-            driver_details, weather, circuit_kpis, weather_risk
+            driver_details, eleventh_pick, weather, grid_provisional, predictions, info
         )
-        # Surface the pit-stop guardrail note so the user understands a capped value.
-        if pit_projection.note:
-            insights.append(pit_projection.note)
-        else:
-            insights.append(
-                f"Projected strategy: {pit_projection.label} "
-                f"(confidence {pit_projection.confidence:.0%})"
-            )
+        insights.append(
+            pit.note
+            or f"Paradas previstas: {pit.label}"
+        )
 
         strategy = {
             "allocation": allocation,
             "driver_details": driver_details,
-            "total_ev": opt_result.get("total_ev", 0),
-            "correlation_penalty": opt_result.get("correlation_penalty", 0),
-            "strategy_type": opt_result.get("strategy_type", user_aggressiveness),
-            "weather_adjusted": opt_result.get("weather_adjusted", False),
+            "eleventh_pick": eleventh_pick,
+            "eleventh_candidates": eleventh_candidates,
+            # Expected chip score plus the expected value of the 11th-place pick.
+            "total_ev": opt.get("expected_total", opt.get("total_ev", 0.0)),
+            "expected_chip_score": opt.get("total_ev", 0.0),
+            "score_range": {
+                "p10": opt.get("p10"),
+                "p50": opt.get("p50"),
+                "p90": opt.get("p90"),
+                "std": opt.get("std"),
+            },
+            "max_score": self.rules.max_score(is_sprint),
+            "strategy_type": opt.get("strategy_type", user_aggressiveness),
+            "constraint_errors": opt.get("constraint_errors", []),
+            "grid_provisional": grid_provisional,
             "is_sprint": is_sprint,
             "n_simulations": n_simulations,
+            "field": field_view,
             "pit_stop_projection": {
-                "projected_stops": pit_projection.projected_stops,
-                "label": pit_projection.label,
-                "raw_estimate": pit_projection.raw_estimate,
-                "capped": pit_projection.capped,
-                "note": pit_projection.note,
+                "projected_stops": pit.projected_stops,
+                "label": pit.label,
+                "raw_estimate": pit.raw_estimate,
+                "capped": pit.capped,
+                "note": pit.note,
             },
             "insights": insights,
         }
-
         logger.info(
-            f"Strategy generated: EV={strategy['total_ev']:.2f}, "
-            f"{len(allocation)} drivers"
+            f"Strategy generated: expected {strategy['total_ev']:.1f} of "
+            f"{strategy['max_score']:.0f}, {len(allocation)} drivers"
         )
         return strategy
 
     def _generate_insights(
         self,
         driver_details: list[dict],
+        eleventh_pick: dict | None,
         weather: dict,
-        circuit_kpis: dict,
-        weather_risk: float,
+        grid_provisional: bool,
+        predictions: dict[str, dict],
+        info: dict[str, dict],
     ) -> list[str]:
-        """Generate human-readable insights for the strategy."""
+        """Short human-readable notes on the recommendation."""
         insights: list[str] = []
 
-        if weather_risk > 0.6:
+        if grid_provisional:
             insights.append(
-                f"High rain probability ({weather.get('rain_probability', 0):.0%}) "
-                "– strategy diversified to reduce risk"
-            )
-        elif weather_risk > 0.3:
-            insights.append("Moderate weather risk – monitor conditions before race")
-
-        ot_index = circuit_kpis.get("avg_overtaking_index", 0.5)
-        if ot_index > 0.6:
-            insights.append(
-                "High overtaking circuit – grid position less important"
-            )
-        elif ot_index < 0.3:
-            insights.append(
-                "Low overtaking – qualifying position is critical"
-            )
-
-        dnf_rate = circuit_kpis.get("avg_dnf_rate", 0.1)
-        if dnf_rate > 0.2:
-            insights.append(
-                f"High DNF rate ({dnf_rate:.0%}) at this circuit – "
-                "consider reliability in picks"
+                "Ainda sem classificação — grid estimado pela forma recente. "
+                "Refaça depois do qualifying: o grid é o dado que mais pesa."
             )
 
         if driver_details:
             top = driver_details[0]
             insights.append(
-                f"Top pick: {top['driver_code']} "
-                f"(EV={top['expected_value']:.1f}, "
-                f"top3={top['top3_probability']:.0%})"
+                f"Principal aposta: {top['driver_code']} "
+                f"(vitória {top['win_probability']:.0%}, pódio {top['top3_probability']:.0%})"
             )
 
+        risky = [
+            d for d in driver_details if d["dnf_probability"] >= 0.25
+        ]
+        for d in risky:
+            insights.append(
+                f"{d['driver_code']} abandona em {d['dnf_probability']:.0%} das simulações "
+                "— já está na conta, mas é um risco conhecido"
+            )
+
+        if eleventh_pick:
+            insights.append(
+                f"11º lugar: {eleventh_pick['driver_code']} "
+                f"({eleventh_pick['probability']:.0%}). Nenhum palpite é favorito — "
+                "o melhor candidato acerta cerca de uma vez em dez."
+            )
+
+        rain = float(weather.get("rain_probability", 0.0) or 0.0)
+        if float(weather.get("weather_risk_index", 0.0) or 0.0) > 0.3 or rain > 0.4:
+            insights.append(
+                f"Risco de chuva ({rain:.0%}) — resultados mais dispersos que o normal"
+            )
         return insights
 
     def format_strategy_report(self, strategy: dict) -> str:
-        """Format strategy as a readable Telegram message."""
-        lines = ["━━━━━━━━━━━━━━━━━"]
-        lines.append("TOKEN ALLOCATION")
-        lines.append("━━━━━━━━━━━━━━━━━")
-
+        """Plain-text rendering of a strategy."""
+        lines = ["━━━━━━━━━━━━━━━━━", "TOKEN ALLOCATION", "━━━━━━━━━━━━━━━━━"]
+        cap = self.rules.max_chips_per_driver
         for d in strategy.get("driver_details", []):
-            tokens_bar = "●" * d["tokens"] + "○" * (5 - d["tokens"])
+            bar = "●" * d["tokens"] + "○" * (cap - d["tokens"])
             lines.append(
-                f"{d['driver_code']}: [{tokens_bar}] {d['tokens']}T "
+                f"{d['driver_code']}: [{bar}] {d['tokens']}T "
                 f"| EV: {d['expected_value']:.1f} "
                 f"| Top3: {d['top3_probability']:.0%} "
                 f"| DNF: {d['dnf_probability']:.0%}"
             )
-
+        pick = strategy.get("eleventh_pick")
+        if pick:
+            lines.append(f"11th: {pick['driver_code']} ({pick['probability']:.0%})")
         lines.append("━━━━━━━━━━━━━━━━━")
         lines.append(
-            f"Total EV: {strategy.get('total_ev', 0):.2f} | "
-            f"Strategy: {strategy.get('strategy_type', 'balanced')}"
+            f"Expected: {strategy.get('total_ev', 0):.1f} of "
+            f"{strategy.get('max_score', 0):.0f} | "
+            f"Profile: {strategy.get('strategy_type', 'balanced')}"
         )
-
-        if strategy.get("weather_adjusted"):
-            lines.append("Weather adjusted: YES (high rain risk)")
-
         insights = strategy.get("insights", [])
         if insights:
             lines.append("")
             lines.append("INSIGHTS")
-            for i in insights:
-                lines.append(f"  {i}")
-
+            lines.extend(f"  {i}" for i in insights)
         return "\n".join(lines)
