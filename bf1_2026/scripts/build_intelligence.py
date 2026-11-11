@@ -18,7 +18,7 @@ import uuid
 
 import pandas as pd
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import AsyncSessionLocal
 from app.elo.elo_engine import ELOEngine
@@ -34,6 +34,7 @@ from app.utils.season_window import (
     ERA_ELO_REGRESSION,
     MIN_ROWS_FOR_ERA_ONLY,
     crosses_era_boundary,
+    era_start_for,
     regress_elo_for_new_era,
     seasons_in_scope,
 )
@@ -190,19 +191,17 @@ async def compute_team_kpis() -> None:
     calc = TeamKPICalculator()
     async with AsyncSessionLocal() as session:
         teams = (await session.execute(select(Team))).scalars().all()
+        latest_season = await session.scalar(select(func.max(Race.season)))
+        era_start = era_start_for(latest_season) if latest_season else 0
         for team in teams:
-            drivers = (
-                await session.execute(
-                    select(Driver).where(Driver.team_id == team.id)
-                )
-            ).scalars().all()
-            driver_ids = [d.id for d in drivers]
-            if not driver_ids:
-                continue
-
+            # Results carry the team the driver raced for in that session.
+            # This used to gather "every result of the team's current
+            # drivers", which credited Hamilton's Mercedes seasons to Ferrari.
             results = (
                 await session.execute(
-                    select(RaceResult).where(RaceResult.driver_id.in_(driver_ids))
+                    select(RaceResult)
+                    .join(Race, Race.id == RaceResult.race_id)
+                    .where(RaceResult.team_id == team.id, Race.season >= era_start)
                 )
             ).scalars().all()
             if not results:

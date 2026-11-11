@@ -1,13 +1,28 @@
-"""Ingest historical F1 data (calendar, qualifying, race & sprint results).
+"""Sync calendar and results from the F1 results API into Postgres.
 
-Pulls from the Ergast/OpenF1 fallback collector and writes circuits, races,
-qualifying_results, race_results and sprint_results into Postgres.
+    python -m scripts.ingest                  # current regulation era -> now
+    python -m scripts.ingest 2022 2026        # inclusive range
+    python -m scripts.ingest 2026 --refresh   # re-download even stored rounds
 
-Idempotent at the race level: a (season, round) already present is skipped, so
-re-running only fills gaps.
+This is a *sync*, not a one-shot import: every run brings the database in line
+with the API for the seasons asked for.
 
-    python -m scripts.ingest 2021 2025      # inclusive range
-    python -m scripts.ingest                # defaults to last 5 seasons
+* the calendar is upserted by (season, round) — dates, start times, sprint
+  flags and circuits follow the API, so a rescheduled or added race needs no
+  code change;
+* a finished round with no stored results gets them; rounds already stored
+  are left alone unless ``--refresh`` is given;
+* the active roster is rewritten from the latest entry list.
+
+Two bugs this replaces. The previous version skipped any (season, round) that
+already existed — but the seed creates every race of the current season up
+front, so **no result of the season in progress was ever stored**. And its
+default range ended at last year, so the current season was not even asked
+for.
+
+Requests are made per season, not per race (5 paginated calls for a season of
+results instead of ~22), which keeps a five-season sync around 180 requests —
+inside the API's 500-per-hour limit.
 """
 
 from __future__ import annotations
@@ -17,235 +32,337 @@ import sys
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from app.collectors.f1_api_fallback import F1ApiFallback
 from app.database import AsyncSessionLocal
-from app.models.circuit import Circuit, TrackType
 from app.models.driver import Driver
 from app.models.qualifying_result import QualifyingResult
 from app.models.race import Race, RaceStatus
 from app.models.race_result import RaceResult
 from app.models.sprint_result import SprintResult
 from app.models.team import Team
+from app.utils.season_window import current_season, era_start_for
+from scripts.seed import upsert_circuit, upsert_race
+
+_F1_SUFFIXES = (" F1 Team", " Racing", " Formula 1 Team")
 
 
-async def _get_or_create_team(session, name: str) -> Team:
-    if not name:
-        name = "Unknown"
-    result = await session.execute(select(Team).where(Team.name == name))
-    team = result.scalar_one_or_none()
+async def _get_or_create_team(session, name: str, ref: str | None = None) -> Team:
+    name = name or "Unknown"
+    team = None
+    if ref:
+        team = (await session.execute(select(Team).where(Team.ref == ref))).scalar_one_or_none()
     if team is None:
-        team = Team(name=name, full_name=name, is_active=False)
+        candidates = [name] + [name[: -len(s)] for s in _F1_SUFFIXES if name.endswith(s)]
+        for candidate in candidates:
+            team = (
+                await session.execute(select(Team).where(Team.name == candidate))
+            ).scalar_one_or_none()
+            if team is not None:
+                break
+        if team is not None and ref and team.ref and team.ref != ref:
+            team = None     # same display name, different constructor
+    if team is None:
+        team = Team(name=name, full_name=name, ref=ref or None, is_active=False)
         session.add(team)
         await session.flush()
+    elif ref and not team.ref:
+        team.ref = ref
     return team
 
 
-async def _get_or_create_driver(session, code: str, name: str, team: Team) -> Driver | None:
-    if not code:
+async def _get_or_create_driver(session, row: dict, team: Team) -> Driver | None:
+    """Match on the API's driverId, then on the 3-letter code."""
+    ref, code = row.get("driver_ref") or None, row.get("driver_code") or ""
+    if not ref and not code:
         return None
-    result = await session.execute(select(Driver).where(Driver.code == code))
-    driver = result.scalar_one_or_none()
+    driver = None
+    if ref:
+        driver = (
+            await session.execute(select(Driver).where(Driver.ref == ref))
+        ).scalar_one_or_none()
+    if driver is None and code:
+        driver = (
+            await session.execute(select(Driver).where(Driver.code == code))
+        ).scalar_one_or_none()
+        if driver is not None and ref and driver.ref and driver.ref != ref:
+            # Another driver already owns this code (codes get reused).
+            logger.warning(f"Code {code} belongs to {driver.ref}; skipping {ref}")
+            return None
     if driver is None:
-        # Historical driver no longer on the grid: create as inactive.
         driver = Driver(
-            name=name or code,
-            code=code,
-            number=0,
-            nationality="Unknown",
+            name=row.get("driver") or code,
+            code=code[:3],
+            ref=ref,
+            number=row.get("driver_number") or 0,
+            nationality=row.get("nationality") or "Unknown",
             team_id=team.id,
             is_active=False,
         )
         session.add(driver)
         await session.flush()
-        logger.debug(f"Created historical driver {code}")
+        logger.debug(f"Created driver {code} ({ref})")
+    elif ref and not driver.ref:
+        driver.ref = ref
     return driver
 
 
-async def _get_or_create_circuit(session, name: str, country: str, lat: float, lon: float) -> Circuit:
-    result = await session.execute(select(Circuit).where(Circuit.name == name))
-    circuit = result.scalar_one_or_none()
-    if circuit is None:
-        circuit = Circuit(
-            name=name or "Unknown Circuit",
-            country=country or "Unknown",
-            city=country or "Unknown",
-            track_type=TrackType.mixed,
-            latitude=lat or None,
-            longitude=lon or None,
+async def _count(session, model, race_id) -> int:
+    return (
+        await session.scalar(
+            select(func.count()).select_from(model).where(model.race_id == race_id)
         )
-        session.add(circuit)
-        await session.flush()
-        logger.info(f"Created circuit {name}")
-    return circuit
+    ) or 0
 
 
-async def _race_exists(session, season: int, rnd: int) -> bool:
-    result = await session.execute(
-        select(Race.id).where(Race.season == season, Race.round_number == rnd)
+async def _needs_results(session, race: Race, refresh: bool) -> bool:
+    if refresh:
+        return True
+    total = await _count(session, RaceResult, race.id)
+    if total == 0:
+        return True
+    # Rows written before team attribution existed are re-synced once.
+    missing_team = await session.scalar(
+        select(func.count())
+        .select_from(RaceResult)
+        .where(RaceResult.race_id == race.id, RaceResult.team_id.is_(None))
     )
-    return result.scalar_one_or_none() is not None
+    return bool(missing_team)
 
 
-def _parse_date(date_str: str) -> datetime | None:
-    """Parse an ISO date, or return None if it cannot be trusted.
-
-    This used to fall back to `datetime.now()`, which stamped every
-    unparseable race with the moment the script ran. A whole season could end
-    up sharing one timestamp, destroying the chronological ordering that ELO
-    replay and the model's TimeSeriesSplit both depend on — silently. Returning
-    None lets the caller skip the race loudly instead.
-    """
-    try:
-        return datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
-
-
-async def ingest_season(collector: F1ApiFallback, season: int) -> None:
+async def sync_season(
+    collector: F1ApiFallback,
+    season: int,
+    refresh: bool = False,
+    with_pit_stops: bool = True,
+) -> dict:
+    """Bring one season in line with the API. Returns counters for logging."""
+    stats = {"races": 0, "results": 0, "sprints": 0, "qualifying": 0}
     calendar = await collector.fetch_calendar(season)
     if not calendar:
         logger.warning(f"No calendar for {season}")
-        return
+        return stats
 
-    for race in calendar:
-        rnd = race["round"]
+    results = await collector.fetch_season_results(season)
+    sprints = await collector.fetch_season_sprints(season) if any(
+        c["is_sprint"] for c in calendar
+    ) else {}
+    qualifying = await collector.fetch_season_qualifying(season)
+
+    for cal in calendar:
+        rnd = cal["round"]
+        start = cal.get("start")
+        if start is None:
+            logger.warning(
+                f"{season} R{rnd}: unparseable date {cal.get('date')!r} — "
+                "skipping rather than corrupting the chronology."
+            )
+            continue
+
         async with AsyncSessionLocal() as session:
-            if await _race_exists(session, season, rnd):
-                logger.debug(f"{season} R{rnd} already ingested, skipping")
-                continue
-
-            # Fetch results BEFORE writing anything. A race row committed with
-            # zero results is never repaired: the next run sees _race_exists()
-            # and skips it forever, so a single transient 429 used to erase a
-            # Grand Prix from the dataset permanently, with only a warning.
-            results = await collector.fetch_race_results(season, rnd)
-            if not results:
-                logger.warning(
-                    f"{season} R{rnd}: no results returned — leaving it "
-                    "un-ingested so a later run can retry it."
-                )
-                continue
-
-            race_date = _parse_date(race.get("date", ""))
-            if race_date is None:
-                logger.warning(
-                    f"{season} R{rnd}: unparseable date {race.get('date')!r} — "
-                    "skipping rather than corrupting the chronology."
-                )
-                continue
-
-            circuit = await _get_or_create_circuit(
+            circuit = await upsert_circuit(
                 session,
-                race.get("circuit") or race.get("race_name", ""),
-                race.get("country", ""),
-                race.get("latitude", 0.0),
-                race.get("longitude", 0.0),
+                cal.get("circuit_ref") or None,
+                cal.get("circuit") or cal.get("race_name", ""),
+                cal.get("locality", ""),
+                cal.get("country", ""),
+                cal.get("latitude"),
+                cal.get("longitude"),
             )
-
-            race_row = Race(
-                circuit_id=circuit.id,
-                season=season,
-                round_number=rnd,
-                race_name=race.get("race_name", f"Round {rnd}"),
-                race_date=race_date,
-                is_sprint_weekend=race.get("is_sprint", False),
-                status=RaceStatus.finished,
+            race, _ = await upsert_race(
+                session, season, rnd,
+                name=cal.get("race_name") or f"Round {rnd}",
+                start=start, circuit=circuit,
+                sprint_start=cal.get("sprint_start") if cal.get("is_sprint") else None,
+                qualifying_start=cal.get("qualifying_start"),
             )
-            session.add(race_row)
-            await session.flush()
+            stats["races"] += 1
 
-            # --- Pit stop counts (per driver, matched by Ergast driverId) ---
-            pit_counts: dict[str, int] = {}
-            for p in await collector.fetch_pit_stops(season, rnd):
-                ref = p.get("driver", "")
-                if ref:
-                    pit_counts[ref] = pit_counts.get(ref, 0) + 1
+            # ---- race results ------------------------------------------- #
+            rows = results.get(rnd) or []
+            if rows and await _needs_results(session, race, refresh):
+                pit_counts: dict[str, int] = {}
+                if with_pit_stops:
+                    for p in await collector.fetch_pit_stops(season, rnd):
+                        if p.get("driver"):
+                            pit_counts[p["driver"]] = pit_counts.get(p["driver"], 0) + 1
 
-            # --- Race results (already fetched above) ---
-            for r in results:
-                team = await _get_or_create_team(session, r.get("team", ""))
-                driver = await _get_or_create_driver(
-                    session, r.get("driver_code", ""), r.get("driver", ""), team
-                )
-                if driver is None:
-                    continue
-                session.add(
-                    RaceResult(
-                        race_id=race_row.id,
-                        driver_id=driver.id,
-                        final_position=r.get("position"),
-                        grid_position=r.get("grid", 0) or 0,
-                        points_scored=r.get("points", 0.0),
-                        fastest_lap=r.get("fastest_lap", False),
-                        dnf=r.get("dnf", False),
-                        dnf_reason=r.get("dnf_reason"),
-                        laps_completed=r.get("laps", 0),
-                        pit_stops=pit_counts.get(r.get("driver_ref", ""), 0),
+                await session.execute(delete(RaceResult).where(RaceResult.race_id == race.id))
+                grid: dict[str, int] = {}
+                for r in rows:
+                    team = await _get_or_create_team(session, r["team"], r["team_ref"])
+                    driver = await _get_or_create_driver(session, r, team)
+                    if driver is None:
+                        continue
+                    session.add(
+                        RaceResult(
+                            race_id=race.id,
+                            driver_id=driver.id,
+                            team_id=team.id,
+                            final_position=r["position"],
+                            grid_position=r["grid"],
+                            points_scored=r["points"],
+                            fastest_lap=r["fastest_lap"],
+                            dnf=r["dnf"],
+                            dnf_reason=r["status"] if r["dnf"] else None,
+                            laps_completed=r["laps"],
+                            pit_stops=pit_counts.get(r["driver_ref"], 0),
+                        )
                     )
-                )
+                    if r["grid"] > 0:
+                        grid[str(driver.id)] = r["grid"]
+                race.starting_grid = grid or race.starting_grid
+                race.status = RaceStatus.finished
+                stats["results"] += 1
 
-            # --- Qualifying results ---
-            quali = await collector.fetch_qualifying_results(season, rnd)
-            for q in quali:
-                res = await session.execute(
-                    select(Driver).where(Driver.code == q.get("driver_code", ""))
+            # ---- sprint results ----------------------------------------- #
+            srows = sprints.get(rnd) or []
+            if srows and (refresh or await _count(session, SprintResult, race.id) == 0):
+                await session.execute(
+                    delete(SprintResult).where(SprintResult.race_id == race.id)
                 )
-                driver = res.scalar_one_or_none()
-                if driver is None:
-                    continue
-                session.add(
-                    QualifyingResult(
-                        race_id=race_row.id,
-                        driver_id=driver.id,
-                        grid_position=q.get("position", 0) or 0,
-                        q1_time=q.get("q1_time"),
-                        q2_time=q.get("q2_time"),
-                        q3_time=q.get("q3_time"),
-                    )
-                )
-
-            # --- Sprint results (only on sprint weekends) ---
-            if race.get("is_sprint"):
-                sprint = await collector.fetch_sprint_results(season, rnd)
-                for s in sprint:
-                    res = await session.execute(
-                        select(Driver).where(Driver.code == s.get("driver_code", ""))
-                    )
-                    driver = res.scalar_one_or_none()
+                sgrid: dict[str, int] = {}
+                for r in srows:
+                    team = await _get_or_create_team(session, r["team"], r["team_ref"])
+                    driver = await _get_or_create_driver(session, r, team)
                     if driver is None:
                         continue
                     session.add(
                         SprintResult(
-                            race_id=race_row.id,
+                            race_id=race.id,
                             driver_id=driver.id,
-                            final_position=s.get("position"),
-                            grid_position=s.get("position", 0) or 0,
-                            points_scored=s.get("points", 0.0),
-                            dnf=s.get("dnf", False),
+                            team_id=team.id,
+                            final_position=r["position"],
+                            grid_position=r["grid"],
+                            points_scored=r["points"],
+                            dnf=r["dnf"],
+                            dnf_reason=r["status"] if r["dnf"] else None,
                         )
                     )
+                    if r["grid"] > 0:
+                        sgrid[str(driver.id)] = r["grid"]
+                race.sprint_grid = sgrid or race.sprint_grid
+                stats["sprints"] += 1
+
+            # ---- qualifying --------------------------------------------- #
+            qrows = qualifying.get(rnd) or []
+            if qrows and (refresh or await _count(session, QualifyingResult, race.id) == 0):
+                await session.execute(
+                    delete(QualifyingResult).where(QualifyingResult.race_id == race.id)
+                )
+                for q in qrows:
+                    team = await _get_or_create_team(session, q["team"], q["team_ref"])
+                    driver = await _get_or_create_driver(session, q, team)
+                    if driver is None:
+                        continue
+                    session.add(
+                        QualifyingResult(
+                            race_id=race.id,
+                            driver_id=driver.id,
+                            grid_position=q["position"],
+                            q1_time=q["q1_time"],
+                            q2_time=q["q2_time"],
+                            q3_time=q["q3_time"],
+                        )
+                    )
+                if race.status == RaceStatus.scheduled:
+                    race.status = RaceStatus.qualifying_done
+                stats["qualifying"] += 1
 
             await session.commit()
-            logger.info(f"Ingested {season} R{rnd}: {race_row.race_name}")
+
+    # Rounds that are no longer on the calendar (a cancelled race) and never
+    # ran are marked cancelled rather than left as phantom fixtures.
+    last_round = max(c["round"] for c in calendar)
+    async with AsyncSessionLocal() as session:
+        stale = (
+            await session.execute(
+                select(Race).where(Race.season == season, Race.round_number > last_round)
+            )
+        ).scalars().all()
+        for race in stale:
+            if await _count(session, RaceResult, race.id) == 0:
+                race.status = RaceStatus.cancelled
+        await session.commit()
+
+    logger.info(
+        f"Synced {season}: {stats['races']} rounds on the calendar, "
+        f"{stats['results']} new result sets, {stats['sprints']} sprints, "
+        f"{stats['qualifying']} qualifying sessions"
+    )
+    return stats
 
 
-async def ingest(start: int, end: int) -> None:
+async def sync_roster() -> int:
+    """Make the active grid match the most recent entry list.
+
+    The seed's grid is a snapshot. Drivers change mid-season (in 2026 Haas
+    alone ran three different second drivers), so after every sync the active
+    flag and each driver's team are taken from whoever took part in the latest
+    finished race. Returns the number of active drivers.
+    """
+    async with AsyncSessionLocal() as session:
+        latest = (
+            await session.execute(
+                select(Race)
+                .join(RaceResult, RaceResult.race_id == Race.id)
+                .order_by(Race.race_date.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if latest is None:
+            return 0
+        entries = (
+            await session.execute(
+                select(RaceResult.driver_id, RaceResult.team_id).where(
+                    RaceResult.race_id == latest.id
+                )
+            )
+        ).all()
+        if len(entries) < 10:      # not a believable entry list
+            return 0
+        team_of = {d: t for d, t in entries}
+
+        for driver in (await session.execute(select(Driver))).scalars().all():
+            if driver.id in team_of:
+                driver.is_active = True
+                if team_of[driver.id] is not None:
+                    driver.team_id = team_of[driver.id]
+            else:
+                driver.is_active = False
+        active_teams = {t for t in team_of.values() if t is not None}
+        for team in (await session.execute(select(Team))).scalars().all():
+            team.is_active = team.id in active_teams
+        await session.commit()
+        logger.info(
+            f"Roster synced from {latest.season} R{latest.round_number} "
+            f"{latest.race_name}: {len(team_of)} active drivers"
+        )
+        return len(team_of)
+
+
+async def ingest(start: int, end: int, refresh: bool = False) -> None:
     collector = F1ApiFallback()
     try:
         for season in range(start, end + 1):
-            logger.info(f"=== Ingesting season {season} ===")
-            await ingest_season(collector, season)
+            logger.info(f"=== Syncing season {season} ===")
+            await sync_season(collector, season, refresh=refresh)
     finally:
         await collector.close()
-    logger.info(f"Ingestion complete: {start}-{end}")
+    await sync_roster()
+    logger.info(f"Sync complete: {start}-{end}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3:
-        start_year, end_year = int(sys.argv[1]), int(sys.argv[2])
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    this_year = current_season(datetime.now(timezone.utc))
+    if len(args) >= 2:
+        start_year, end_year = int(args[0]), int(args[1])
+    elif len(args) == 1:
+        start_year = end_year = int(args[0])
     else:
-        current = datetime.now().year
-        start_year, end_year = current - 5, current - 1
-    asyncio.run(ingest(start_year, end_year))
+        # Everything the model uses: the current regulation era plus the
+        # tail of the previous one, for ratings.
+        start_year, end_year = min(era_start_for(this_year), this_year - 4), this_year
+    asyncio.run(ingest(start_year, end_year, refresh="--refresh" in sys.argv))

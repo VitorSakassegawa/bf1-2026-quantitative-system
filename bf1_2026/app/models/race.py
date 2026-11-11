@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -51,6 +51,11 @@ class Race(Base):
     status: Mapped[RaceStatus] = mapped_column(
         Enum(RaceStatus), default=RaceStatus.scheduled, nullable=False
     )
+    # Official starting grids ({driver_id: position}), penalties applied.
+    # Qualifying order is only a proxy for these; the grid is what the model
+    # is anchored on, so it is stored once published.
+    starting_grid: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    sprint_grid: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     deadline_bets: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

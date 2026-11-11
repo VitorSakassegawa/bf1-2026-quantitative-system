@@ -17,6 +17,9 @@ class Team(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    # Stable identifier from the results API (Jolpica's constructorId). Names and
+    # three-letter codes get reused and renamed; this does not.
+    ref: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     current_elo: Mapped[float] = mapped_column(Float, default=1500.0, nullable=False)
     reliability_index: Mapped[float | None] = mapped_column(Float, nullable=True)

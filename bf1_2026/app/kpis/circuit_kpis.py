@@ -142,5 +142,5 @@ class CircuitKPICalculator:
             ),
         }
 
-        logger.info(f"Circuit KPIs calculated: {kpis}")
+        logger.debug(f"Circuit KPIs calculated: {kpis}")
         return kpis

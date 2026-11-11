@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, Integer, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -49,6 +49,11 @@ class Bet(Base):
     )
     total_tokens: Mapped[int] = mapped_column(Integer, default=15, nullable=False)
     allocations: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # The pool's second bet: who finishes exactly 11th (+50 when right).
+    eleventh_driver_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("drivers.id"), nullable=True
+    )
+    eleventh_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     expected_value: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

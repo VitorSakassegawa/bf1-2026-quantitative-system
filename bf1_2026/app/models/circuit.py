@@ -30,6 +30,9 @@ class Circuit(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Stable identifier from the results API (Jolpica's circuitId). Names and
+    # three-letter codes get reused and renamed; this does not.
+    ref: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     country: Mapped[str] = mapped_column(String(100), nullable=False)
     city: Mapped[str] = mapped_column(String(100), nullable=False)
     track_type: Mapped[TrackType] = mapped_column(

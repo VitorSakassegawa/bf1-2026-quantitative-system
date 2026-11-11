@@ -1,35 +1,58 @@
-"""F1 API fallback – Jolpica (Ergast-compatible) and OpenF1 as data source."""
+"""F1 results collector – Jolpica (the Ergast successor) and OpenF1.
+
+Jolpica is the system's primary source of race, sprint and qualifying data.
+
+Three things that matter in practice:
+
+* **Status vocabulary.** Jolpica reports classified finishers as ``Finished``
+  or ``Lapped`` (2026) — the Ergast-era ``+1 Lap`` strings are gone. A parser
+  that only knows the old strings records every lapped finisher as a
+  retirement: 129 rows in 2026 alone.
+* **Rate limits.** 4 requests/second and 500/hour. Fetching one race at a
+  time costs ~4 requests per round (≈440 for five seasons), so the season
+  endpoints are used instead: a whole season of results is 5 paginated
+  requests.
+* **Pagination.** Endpoints default to 30 rows. Everything here asks for the
+  maximum page size (100) and follows ``MRData.total``.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import re
 import time
+from datetime import datetime, timezone
 
 import httpx
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from app.config import settings
+_FINISHED = re.compile(r"^(Finished|Lapped|\+\d+ Laps?)$")
+_NOT_STARTED = {"Did not start", "Withdrew", "Did not qualify", "Did not prequalify"}
+
+
+def _retryable(exc: BaseException) -> bool:
+    """Retry rate limits, server errors and transport failures — not 404s."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
 
 
 class F1ApiFallback:
-    """
-    Fallback data collector using the Jolpica and OpenF1 APIs.
-    Provides the same interface as F1DataCollector.
-    """
+    """Collector for the Jolpica (Ergast-compatible) and OpenF1 APIs."""
 
-    # ergast.com was frozen after the 2024 season and the host no longer
-    # serves current data. Jolpica is the drop-in successor: identical JSON
-    # shape and path structure, so only the base URL changes.
+    # ergast.com was frozen after the 2024 season. Jolpica is the drop-in
+    # successor: identical JSON shape and paths, only the base URL changes.
     BASE_URL_ERGAST = "https://api.jolpi.ca/ergast/f1"
     BASE_URL_OPENF1 = "https://api.openf1.org/v1"
 
-    # Ergast-compatible endpoints default to limit=30 and silently truncate.
-    # A modern GP has ~50 pit stops, so the default cut them off mid-race.
-    PAGE_LIMIT = 100
-    # Jolpica publishes a 4 req/s burst limit; stay under it.
-    MIN_REQUEST_INTERVAL = 0.35
+    PAGE_LIMIT = 100               # the API's maximum page size
+    MIN_REQUEST_INTERVAL = 0.35    # stay under the 4 req/s burst limit
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -41,11 +64,11 @@ class F1ApiFallback:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0),
                 follow_redirects=True,
+                headers={"User-Agent": "bf1-quant/1.0"},
             )
         return self._client
 
     async def _rate_limit(self) -> None:
-        """Space out requests. Ingest issues ~4 calls per race back-to-back."""
         async with self._rate_lock:
             elapsed = time.monotonic() - self._last_request_at
             if elapsed < self.MIN_REQUEST_INTERVAL:
@@ -53,334 +76,152 @@ class F1ApiFallback:
             self._last_request_at = time.monotonic()
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception(_retryable),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        reraise=True,
     )
-    async def _fetch_json(self, url: str) -> dict:
+    async def _fetch_json(self, url: str):
         await self._rate_limit()
         client = await self._get_client()
-        logger.debug(f"API fallback fetching {url}")
+        logger.debug(f"F1 API fetching {url}")
         resp = await client.get(url)
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
 
-        # Warn loudly if the server holds more rows than we asked for, rather
-        # than silently analysing a truncated race.
-        mrdata = data.get("MRData", {})
-        try:
-            total = int(mrdata.get("total", 0))
-            limit = int(mrdata.get("limit", 0))
-            offset = int(mrdata.get("offset", 0))
-            if total > offset + limit:
-                logger.warning(
-                    f"Truncated response from {url}: {total} rows available, "
-                    f"got {limit} at offset {offset}. Raise PAGE_LIMIT or page."
-                )
-        except (TypeError, ValueError):
-            pass
-        return data
-
-    def _paged(self, path: str) -> str:
-        """Build an Ergast-style URL with an explicit, non-default limit."""
+    def _paged(self, path: str, offset: int = 0) -> str:
         sep = "&" if "?" in path else "?"
-        return f"{path}{sep}limit={self.PAGE_LIMIT}"
+        url = f"{path}{sep}limit={self.PAGE_LIMIT}"
+        return f"{url}&offset={offset}" if offset else url
 
+    async def _fetch_races(self, path: str, list_key: str | None = None) -> list[dict]:
+        """Fetch every page of a RaceTable endpoint, merging rounds split across pages."""
+        races: dict[str, dict] = {}
+        offset, total = 0, None
+        while total is None or offset < total:
+            data = (await self._fetch_json(self._paged(path, offset))).get("MRData", {})
+            total = int(data.get("total", 0))
+            for race in data.get("RaceTable", {}).get("Races", []):
+                key = f"{race.get('season')}-{race.get('round')}"
+                if key not in races:
+                    races[key] = race
+                elif list_key:
+                    races[key].setdefault(list_key, []).extend(race.get(list_key, []))
+            offset += self.PAGE_LIMIT
+        return sorted(races.values(), key=lambda r: (int(r["season"]), int(r["round"])))
+
+    # ------------------------------------------------------------------ #
+    # Parsing
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _is_dnf(status: str) -> bool:
-        """True only for genuine non-finishes.
+        """True when the driver was not a classified finisher.
 
-        A driver classified any number of laps down still finished. The old
-        allowlist stopped at "+3 Laps", so "+4 Laps" and beyond were recorded
-        as retirements *with* a valid finishing position — which then flowed
-        into ELO (forced to P20), circuit DNF rates, team reliability and the
-        XGBoost training label. Matching the "+N Lap(s)" pattern instead of
-        enumerating it keeps classified finishers on the right side.
+        ``Finished``, ``Lapped`` and the Ergast-era ``+N Lap(s)`` all mean the
+        car took the flag. Anything else — ``Retired``, ``Did not start``,
+        ``Disqualified`` — did not score.
+        """
+        return _FINISHED.match((status or "").strip()) is None
+
+    @staticmethod
+    def _is_retirement(status: str) -> bool:
+        """True when the pool charges its retirement penalty.
+
+        A car that never started is not a retirement: checked against the
+        pool's official scores, which do not penalise a DNS.
         """
         s = (status or "").strip()
-        if s == "Finished":
-            return False
-        return re.fullmatch(r"\+\d+ Laps?", s) is None
+        return F1ApiFallback._is_dnf(s) and s not in _NOT_STARTED
 
-    async def fetch_calendar(self, season: int) -> list[dict]:
-        """Fetch race calendar from Ergast API."""
-        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}.json")
-        try:
-            data = await self._fetch_json(url)
-            races_raw = (
-                data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
-            )
-
-            races: list[dict] = []
-            for race in races_raw:
-                races.append(
-                    {
-                        "round": int(race.get("round", 0)),
-                        "race_name": race.get("raceName", ""),
-                        "circuit": race.get("Circuit", {}).get(
-                            "circuitName", ""
-                        ),
-                        "country": race.get("Circuit", {})
-                        .get("Location", {})
-                        .get("country", ""),
-                        "date": race.get("date", ""),
-                        # Sprint weekends are flagged by a separate "Sprint"
-                        # object on the race, not by the race name: raceName is
-                        # always "<Country> Grand Prix" and never contains the
-                        # word "Sprint", so the old substring test was always
-                        # False and sprint results were never ingested at all.
-                        "is_sprint": bool(race.get("Sprint")),
-                        "latitude": float(
-                            race.get("Circuit", {})
-                            .get("Location", {})
-                            .get("lat", 0)
-                        ),
-                        "longitude": float(
-                            race.get("Circuit", {})
-                            .get("Location", {})
-                            .get("long", 0)
-                        ),
-                    }
-                )
-
-            logger.info(f"Ergast: fetched {len(races)} races for {season}")
-            return races
-        except Exception as e:
-            logger.warning(f"Ergast calendar failed for {season}: {e}")
-            return await self._fetch_calendar_openf1(season)
-
-    async def _fetch_calendar_openf1(self, season: int) -> list[dict]:
-        """Fallback to OpenF1 for calendar."""
-        url = f"{self.BASE_URL_OPENF1}/sessions?year={season}&session_type=Race"
-        try:
-            data = await self._fetch_json(url)
-            if not isinstance(data, list):
-                return []
-            races = []
-            for idx, session in enumerate(data, 1):
-                races.append(
-                    {
-                        "round": idx,
-                        "race_name": session.get("meeting_name", ""),
-                        "circuit": session.get("circuit_short_name", ""),
-                        "country": session.get("country_name", ""),
-                        "date": session.get("date_start", ""),
-                        "is_sprint": False,
-                    }
-                )
-            logger.info(f"OpenF1: fetched {len(races)} races for {season}")
-            return races
-        except Exception as e:
-            logger.error(f"OpenF1 calendar also failed for {season}: {e}")
-            return []
-
-    async def fetch_qualifying_results(
-        self, season: int, round_num: int
-    ) -> list[dict]:
-        """Fetch qualifying results from Ergast API."""
-        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/qualifying.json")
-        try:
-            data = await self._fetch_json(url)
-            quali_raw = (
-                data.get("MRData", {})
-                .get("RaceTable", {})
-                .get("Races", [{}])[0]
-                .get("QualifyingResults", [])
-            )
-
-            results: list[dict] = []
-            for q in quali_raw:
-                driver = q.get("Driver", {})
-                results.append(
-                    {
-                        "position": int(q.get("position", 0)),
-                        "driver": f"{driver.get('givenName', '')} {driver.get('familyName', '')}",
-                        "driver_code": driver.get("code", ""),
-                        "q1_time": self._parse_ergast_time(q.get("Q1")),
-                        "q2_time": self._parse_ergast_time(q.get("Q2")),
-                        "q3_time": self._parse_ergast_time(q.get("Q3")),
-                    }
-                )
-
-            logger.info(
-                f"Ergast: fetched {len(results)} qualifying results for {season} R{round_num}"
-            )
-            return results
-        except Exception as e:
-            logger.warning(f"Ergast qualifying failed for {season}/R{round_num}: {e}")
-            return []
-
-    async def fetch_race_results(self, season: int, round_num: int) -> list[dict]:
-        """Fetch race results from Ergast API."""
-        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/results.json")
-        try:
-            data = await self._fetch_json(url)
-            results_raw = (
-                data.get("MRData", {})
-                .get("RaceTable", {})
-                .get("Races", [{}])[0]
-                .get("Results", [])
-            )
-
-            results: list[dict] = []
-            for r in results_raw:
-                driver = r.get("Driver", {})
-                constructor = r.get("Constructor", {})
-                status = r.get("status", "")
-                dnf = self._is_dnf(status)
-
-                pos_text = r.get("position", "")
-                position = int(pos_text) if pos_text.isdigit() else None
-
-                results.append(
-                    {
-                        "position": position,
-                        "driver": f"{driver.get('givenName', '')} {driver.get('familyName', '')}",
-                        "driver_code": driver.get("code", ""),
-                        "driver_ref": driver.get("driverId", ""),
-                        "team": constructor.get("name", ""),
-                        "grid": int(r.get("grid", 0)),
-                        "laps": int(r.get("laps", 0)),
-                        "points": float(r.get("points", 0)),
-                        "dnf": dnf,
-                        "dnf_reason": status if dnf else None,
-                        "fastest_lap": r.get("FastestLap", {}).get("rank") == "1",
-                    }
-                )
-
-            logger.info(
-                f"Ergast: fetched {len(results)} race results for {season} R{round_num}"
-            )
-            return results
-        except Exception as e:
-            logger.warning(f"Ergast results failed for {season}/R{round_num}: {e}")
-            return []
-
-    async def fetch_sprint_results(self, season: int, round_num: int) -> list[dict]:
-        """Fetch sprint results from Ergast API."""
-        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/sprint.json")
-        try:
-            data = await self._fetch_json(url)
-            sprint_raw = (
-                data.get("MRData", {})
-                .get("RaceTable", {})
-                .get("Races", [{}])[0]
-                .get("SprintResults", [])
-            )
-
-            results: list[dict] = []
-            for r in sprint_raw:
-                driver = r.get("Driver", {})
-                status = r.get("status", "")
-                dnf = self._is_dnf(status)
-                pos_text = r.get("position", "")
-
-                results.append(
-                    {
-                        "position": int(pos_text) if pos_text.isdigit() else None,
-                        "driver": f"{driver.get('givenName', '')} {driver.get('familyName', '')}",
-                        "driver_code": driver.get("code", ""),
-                        "points": float(r.get("points", 0)),
-                        "dnf": dnf,
-                    }
-                )
-
-            logger.info(
-                f"Ergast: fetched {len(results)} sprint results for {season} R{round_num}"
-            )
-            return results
-        except Exception as e:
-            logger.warning(f"Ergast sprint failed for {season}/R{round_num}: {e}")
-            return []
-
-    async def fetch_pit_stops(self, season: int, round_num: int) -> list[dict]:
-        """Fetch pit stop data from Ergast API."""
-        url = self._paged(f"{self.BASE_URL_ERGAST}/{season}/{round_num}/pitstops.json")
-        try:
-            data = await self._fetch_json(url)
-            pits_raw = (
-                data.get("MRData", {})
-                .get("RaceTable", {})
-                .get("Races", [{}])[0]
-                .get("PitStops", [])
-            )
-
-            stops: list[dict] = []
-            for p in pits_raw:
-                stops.append(
-                    {
-                        "driver": p.get("driverId", ""),
-                        "stop_number": int(p.get("stop", 0)),
-                        "lap": int(p.get("lap", 0)),
-                        "duration": p.get("duration", ""),
-                    }
-                )
-
-            logger.info(
-                f"Ergast: fetched {len(stops)} pit stops for {season} R{round_num}"
-            )
-            return stops
-        except Exception as e:
-            logger.warning(f"Ergast pit stops failed for {season}/R{round_num}: {e}")
-            return []
-
-    async def fetch_fastest_laps(self, season: int, round_num: int) -> list[dict]:
-        """Fetch fastest lap data from race results."""
-        results = await self.fetch_race_results(season, round_num)
-        return [
-            {
-                "driver": r["driver"],
-                "driver_code": r.get("driver_code", ""),
-                "fastest_lap": r.get("fastest_lap", False),
-            }
-            for r in results
-        ]
-
-    async def fetch_historical_data(
-        self, circuit_name: str, years: int = 5
-    ) -> dict:
-        """Fetch historical data for a circuit from APIs."""
-        from datetime import datetime
-
-        current_year = datetime.now().year
-        data: dict = {
-            "circuit": circuit_name,
-            "years_covered": [],
-            "race_results": [],
-            "qualifying_results": [],
-            "pit_stops": [],
+    @classmethod
+    def _parse_result(cls, row: dict) -> dict:
+        driver = row.get("Driver", {})
+        constructor = row.get("Constructor", {})
+        status = row.get("status", "")
+        dnf = cls._is_dnf(status)
+        pos = str(row.get("position", ""))
+        family = driver.get("familyName", "")
+        return {
+            "position": int(pos) if pos.isdigit() and not dnf else None,
+            "position_text": row.get("positionText", ""),
+            "driver": f"{driver.get('givenName', '')} {family}".strip(),
+            "driver_code": driver.get("code") or family[:3].upper(),
+            "driver_ref": driver.get("driverId", ""),
+            "driver_number": int(driver.get("permanentNumber") or row.get("number") or 0),
+            "nationality": driver.get("nationality", ""),
+            "team": constructor.get("name", ""),
+            "team_ref": constructor.get("constructorId", ""),
+            "grid": int(row.get("grid", 0) or 0),
+            "laps": int(row.get("laps", 0) or 0),
+            "points": float(row.get("points", 0) or 0),
+            "status": status,
+            "dnf": dnf,
+            "retired": cls._is_retirement(status),
+            "dnf_reason": status if dnf else None,
+            "fastest_lap": row.get("FastestLap", {}).get("rank") == "1",
         }
 
-        for year in range(current_year - years, current_year):
-            calendar = await self.fetch_calendar(year)
-            for race in calendar:
-                if circuit_name.lower() in race.get("circuit", "").lower() or \
-                   circuit_name.lower() in race.get("race_name", "").lower():
-                    round_num = race["round"]
-                    data["years_covered"].append(year)
+    @classmethod
+    def _parse_qualifying(cls, row: dict) -> dict:
+        driver = row.get("Driver", {})
+        constructor = row.get("Constructor", {})
+        family = driver.get("familyName", "")
+        return {
+            "position": int(row.get("position", 0) or 0),
+            "driver": f"{driver.get('givenName', '')} {family}".strip(),
+            "driver_code": driver.get("code") or family[:3].upper(),
+            "driver_ref": driver.get("driverId", ""),
+            "driver_number": int(driver.get("permanentNumber") or row.get("number") or 0),
+            "nationality": driver.get("nationality", ""),
+            "team": constructor.get("name", ""),
+            "team_ref": constructor.get("constructorId", ""),
+            "q1_time": cls._parse_ergast_time(row.get("Q1")),
+            "q2_time": cls._parse_ergast_time(row.get("Q2")),
+            "q3_time": cls._parse_ergast_time(row.get("Q3")),
+        }
 
-                    results = await self.fetch_race_results(year, round_num)
-                    data["race_results"].extend(
-                        [{**r, "season": year} for r in results]
-                    )
+    @staticmethod
+    def _parse_start(date: str | None, clock: str | None) -> datetime | None:
+        """Combine Jolpica's ``date`` and ``time`` ("07:00:00Z") into UTC."""
+        if not date:
+            return None
+        try:
+            if clock:
+                return datetime.strptime(
+                    f"{date[:10]}T{clock.rstrip('Z')}", "%Y-%m-%dT%H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+            return datetime.strptime(date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
 
-                    quali = await self.fetch_qualifying_results(year, round_num)
-                    data["qualifying_results"].extend(
-                        [{**q, "season": year} for q in quali]
-                    )
-
-                    pits = await self.fetch_pit_stops(year, round_num)
-                    data["pit_stops"].extend([{**p, "season": year} for p in pits])
-                    break
-
-        logger.info(
-            f"API fallback: historical data for {circuit_name}: "
-            f"{len(data['years_covered'])} years"
-        )
-        return data
+    @classmethod
+    def _parse_calendar_race(cls, race: dict) -> dict:
+        circuit = race.get("Circuit", {})
+        loc = circuit.get("Location", {})
+        sprint = race.get("Sprint") or {}
+        quali = race.get("Qualifying") or {}
+        return {
+            "season": int(race.get("season", 0) or 0),
+            "round": int(race.get("round", 0) or 0),
+            "race_name": race.get("raceName", ""),
+            "circuit": circuit.get("circuitName", ""),
+            "circuit_ref": circuit.get("circuitId", ""),
+            "country": loc.get("country", ""),
+            "locality": loc.get("locality", ""),
+            "date": race.get("date", ""),
+            "start": cls._parse_start(race.get("date"), race.get("time")),
+            # Sprint weekends carry a separate "Sprint" object. The race name
+            # is always "<Country> Grand Prix" and never contains the word.
+            "is_sprint": bool(sprint),
+            "sprint_start": cls._parse_start(sprint.get("date"), sprint.get("time")),
+            "qualifying_start": cls._parse_start(quali.get("date"), quali.get("time")),
+            "latitude": float(loc.get("lat", 0) or 0),
+            "longitude": float(loc.get("long", 0) or 0),
+        }
 
     @staticmethod
     def _parse_ergast_time(time_str: str | None) -> float | None:
-        """Parse Ergast time format (e.g., '1:23.456') to seconds."""
+        """Parse a lap time such as '1:23.456' into seconds."""
         if not time_str:
             return None
         try:
@@ -391,11 +232,148 @@ class F1ApiFallback:
         except (ValueError, IndexError):
             return None
 
+    # ------------------------------------------------------------------ #
+    # Season-level fetches (preferred: a handful of requests per season)
+    # ------------------------------------------------------------------ #
+    async def fetch_calendar(self, season: int) -> list[dict]:
+        """The season's calendar with real start times and sprint flags."""
+        try:
+            races = await self._fetch_races(f"{self.BASE_URL_ERGAST}/{season}.json")
+            parsed = [self._parse_calendar_race(r) for r in races]
+            logger.info(f"Jolpica: fetched {len(parsed)} races for {season}")
+            return parsed
+        except Exception as e:
+            logger.warning(f"Jolpica calendar failed for {season}: {e}")
+            return await self._fetch_calendar_openf1(season)
+
+    async def _fetch_calendar_openf1(self, season: int) -> list[dict]:
+        """Fallback calendar from OpenF1 (no sprint flags, dates only)."""
+        url = f"{self.BASE_URL_OPENF1}/sessions?year={season}&session_type=Race"
+        try:
+            data = await self._fetch_json(url)
+            if not isinstance(data, list):
+                return []
+            mains = [s for s in data if s.get("session_name") == "Race"]
+            races = []
+            for idx, session in enumerate(mains, 1):
+                start = None
+                try:
+                    start = datetime.fromisoformat(session.get("date_start", ""))
+                except ValueError:
+                    pass
+                races.append(
+                    {
+                        "season": season,
+                        "round": idx,
+                        "race_name": f"{session.get('country_name', '')} Grand Prix",
+                        "circuit": session.get("circuit_short_name", ""),
+                        "circuit_ref": "",
+                        "country": session.get("country_name", ""),
+                        "locality": session.get("location", ""),
+                        "date": (session.get("date_start") or "")[:10],
+                        "start": start,
+                        "is_sprint": False,
+                        "sprint_start": None,
+                        "qualifying_start": None,
+                        "latitude": 0.0,
+                        "longitude": 0.0,
+                    }
+                )
+            logger.info(f"OpenF1: fetched {len(races)} races for {season}")
+            return races
+        except Exception as e:
+            logger.error(f"OpenF1 calendar also failed for {season}: {e}")
+            return []
+
+    async def fetch_season_results(self, season: int) -> dict[int, list[dict]]:
+        """{round: [result rows]} for every finished race of the season."""
+        races = await self._fetch_races(
+            f"{self.BASE_URL_ERGAST}/{season}/results.json", "Results"
+        )
+        return {
+            int(r["round"]): [self._parse_result(x) for x in r.get("Results", [])]
+            for r in races
+        }
+
+    async def fetch_season_sprints(self, season: int) -> dict[int, list[dict]]:
+        """{round: [sprint result rows]} for every sprint of the season."""
+        races = await self._fetch_races(
+            f"{self.BASE_URL_ERGAST}/{season}/sprint.json", "SprintResults"
+        )
+        return {
+            int(r["round"]): [self._parse_result(x) for x in r.get("SprintResults", [])]
+            for r in races
+        }
+
+    async def fetch_season_qualifying(self, season: int) -> dict[int, list[dict]]:
+        """{round: [qualifying rows]} for the season."""
+        races = await self._fetch_races(
+            f"{self.BASE_URL_ERGAST}/{season}/qualifying.json", "QualifyingResults"
+        )
+        return {
+            int(r["round"]): [
+                self._parse_qualifying(x) for x in r.get("QualifyingResults", [])
+            ]
+            for r in races
+        }
+
+    # ------------------------------------------------------------------ #
+    # Single-round fetches
+    # ------------------------------------------------------------------ #
+    async def _one_round(self, season: int, round_num: int, kind: str, key: str) -> list[dict]:
+        races = await self._fetch_races(
+            f"{self.BASE_URL_ERGAST}/{season}/{round_num}/{kind}.json", key
+        )
+        return races[0].get(key, []) if races else []
+
+    async def fetch_race_results(self, season: int, round_num: int) -> list[dict]:
+        try:
+            rows = await self._one_round(season, round_num, "results", "Results")
+            return [self._parse_result(x) for x in rows]
+        except Exception as e:
+            logger.warning(f"Jolpica results failed for {season}/R{round_num}: {e}")
+            return []
+
+    async def fetch_sprint_results(self, season: int, round_num: int) -> list[dict]:
+        try:
+            rows = await self._one_round(season, round_num, "sprint", "SprintResults")
+            return [self._parse_result(x) for x in rows]
+        except Exception as e:
+            logger.warning(f"Jolpica sprint failed for {season}/R{round_num}: {e}")
+            return []
+
+    async def fetch_qualifying_results(self, season: int, round_num: int) -> list[dict]:
+        try:
+            rows = await self._one_round(
+                season, round_num, "qualifying", "QualifyingResults"
+            )
+            return [self._parse_qualifying(x) for x in rows]
+        except Exception as e:
+            logger.warning(f"Jolpica qualifying failed for {season}/R{round_num}: {e}")
+            return []
+
+    async def fetch_pit_stops(self, season: int, round_num: int) -> list[dict]:
+        """Every pit stop of a race (a modern GP has 35-60, i.e. one page)."""
+        try:
+            rows = await self._one_round(season, round_num, "pitstops", "PitStops")
+            return [
+                {
+                    "driver": p.get("driverId", ""),
+                    "stop_number": int(p.get("stop", 0) or 0),
+                    "lap": int(p.get("lap", 0) or 0),
+                    "duration": p.get("duration", ""),
+                }
+                for p in rows
+            ]
+        except Exception as e:
+            logger.warning(f"Jolpica pit stops failed for {season}/R{round_num}: {e}")
+            return []
+
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
 
 async def get_collector() -> F1ApiFallback:
-    """Factory that returns an API fallback collector."""
+    """Factory that returns the API collector."""
     return F1ApiFallback()

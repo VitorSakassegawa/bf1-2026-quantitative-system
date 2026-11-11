@@ -20,6 +20,9 @@ class Driver(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str] = mapped_column(String(3), unique=True, nullable=False)
+    # Stable identifier from the results API (Jolpica's driverId). Names and
+    # three-letter codes get reused and renamed; this does not.
+    ref: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     nationality: Mapped[str] = mapped_column(String(100), nullable=False)
     team_id: Mapped[uuid.UUID] = mapped_column(

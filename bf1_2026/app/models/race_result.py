@@ -34,6 +34,12 @@ class RaceResult(Base):
     driver_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("drivers.id"), nullable=False
     )
+    # The team the driver raced for in THIS session. Without it every past
+    # result was attributed to the driver's current team (Hamilton's Mercedes
+    # years counted for Ferrari), and a mid-season substitute had no team.
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True
+    )
     final_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     grid_position: Mapped[int] = mapped_column(Integer, nullable=False)
     points_scored: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
