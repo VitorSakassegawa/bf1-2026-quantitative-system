@@ -25,6 +25,8 @@ class PredictionResponse(BaseModel):
 
 class SimulationRequest(BaseModel):
     n_simulations: int = Field(default=20000, ge=1000, le=100000)
+    # True to simulate the weekend's sprint instead of the Grand Prix.
+    sprint: bool = False
 
 
 class SimulationResponse(BaseModel):

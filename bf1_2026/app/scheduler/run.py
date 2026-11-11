@@ -13,9 +13,11 @@ import asyncio
 from loguru import logger
 
 from app.scheduler.jobs import scheduler
+from app.utils.logger import setup_logging
 
 
 async def _main() -> None:
+    setup_logging()
     scheduler.start()
     logger.info("Scheduler process started; waiting for jobs...")
     try:

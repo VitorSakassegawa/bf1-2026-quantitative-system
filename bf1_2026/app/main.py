@@ -17,6 +17,12 @@ from app.utils.security import startup_security_report
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
+    # File logging only outside development, so importing the app in tests or
+    # running it locally never tries to write under /app.
+    if settings.environment != Environment.development:
+        from app.utils.logger import setup_logging
+
+        setup_logging()
     logger.info("BF1-2026 Quantitative System starting up")
 
     # Say plainly, at boot, what is not configured — rather than letting it be

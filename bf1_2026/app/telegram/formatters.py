@@ -1,6 +1,23 @@
-"""Message formatters for Telegram MarkdownV2."""
+"""Message formatters for Telegram MarkdownV2.
+
+Tables are rendered inside code spans: within a code span MarkdownV2 only
+needs the backtick and backslash escaped, which avoids the whole class of
+"unescaped dot -> 400 can't parse entities" failures that used to silently
+kill /analysis, /bet and /leaderboard.
+"""
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from app.config import settings
+
+_SOURCE_LABEL = {
+    "official": "grid oficial",
+    "qualifying": "ordem da classificação (penalidades de grid ainda não aplicadas)",
+    "provisional": "provisório — ainda sem classificação",
+}
 
 
 def escape_md(text: str) -> str:
@@ -9,161 +26,228 @@ def escape_md(text: str) -> str:
     return "".join(f"\\{c}" if c in special else c for c in str(text))
 
 
-def format_race_analysis(analysis: dict) -> str:
-    """Format a complete race analysis for Telegram."""
-    weather = analysis.get("weather", {})
-    rain = weather.get("rain_probability", 0)
-    risk = weather.get("weather_risk_index", 0)
-    temp = weather.get("temperature_air", 25)
-    humidity = weather.get("humidity", 50)
+def code(text: str) -> str:
+    """Inline code span (monospace); only ` and \\ need escaping inside."""
+    return "`" + str(text).replace("\\", "\\\\").replace("`", "'") + "`"
 
-    risk_label = "HIGH" if risk > 0.6 else "MED" if risk > 0.3 else "LOW"
+
+def local_time(value: datetime | str | None, fmt: str = "%d/%m %H:%M") -> str:
+    """Render a moment in the configured display time zone."""
+    if value is None:
+        return "?"
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    try:
+        zone = ZoneInfo(settings.display_timezone)
+    except Exception:
+        zone = timezone.utc
+    return value.astimezone(zone).strftime(fmt)
+
+
+def _countdown(deadline: datetime | str | None) -> str:
+    if deadline is None:
+        return ""
+    if isinstance(deadline, str):
+        try:
+            deadline = datetime.fromisoformat(deadline)
+        except ValueError:
+            return ""
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    seconds = (deadline - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return "encerrado"
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return f"faltam {days}d {hours}h"
+    return f"faltam {hours}h {rest // 60:02d}min"
+
+
+def format_strategy(strategy: dict, pool: dict | None = None) -> str:
+    """The recommended bet for a session: chips, 11th-place pick, what to expect."""
+    race = strategy.get("race", {})
+    deadline = (pool or {}).get("deadline") or race.get("deadline")
+    grid_source = strategy.get("grid_source", "provisional")
+    rng = strategy.get("score_range", {})
 
     lines = [
-        "━━━━━━━━━━━━━━━━━",
-        f"🏎 *GP {escape_md(analysis.get('race_name', 'Unknown'))}* — Round {escape_md(str(analysis.get('round', '?')))}",
-        f"📅 {escape_md(str(analysis.get('date', 'TBD')))} \\| 🏁 {escape_md(str(analysis.get('circuit', 'TBD')))}",
-        "━━━━━━━━━━━━━━━━━",
+        f"🏎 *{escape_md(race.get('name', 'Corrida'))}* — R{escape_md(race.get('round', '?'))}",
+        f"🏁 {escape_md(race.get('circuit', ''))}",
+        f"⏰ Aposta até {escape_md(local_time(deadline))} \\({escape_md(_countdown(deadline))}\\)",
+        f"📋 Grid: {escape_md(_SOURCE_LABEL.get(grid_source, grid_source))}",
         "",
-        "🌤 *WEATHER*",
-        f"  Rain: {rain:.0%} \\| Risk: {escape_md(risk_label)}",
-        f"  Temp: {temp:.0f}°C \\| Humidity: {humidity:.0f}%",
-        "",
-        "📊 *TOP 5 DRIVERS*",
+        "🎯 *APOSTA RECOMENDADA*",
     ]
-
-    for i, d in enumerate(analysis.get("top_drivers", [])[:5], 1):
-        # The decimal point in a formatted float must be escaped for
-        # MarkdownV2, otherwise Telegram rejects the entire message with
-        # 400 "can't parse entities" and the user sees nothing at all.
-        ev = escape_md(f"{d['ev']:.1f}")
+    for d in strategy.get("driver_details", []):
+        bar = "●" * d["tokens"] + "○" * (5 - d["tokens"])
+        grid = f"P{d['grid_position']}" if d.get("grid_position") else "–"
         lines.append(
-            f"  {i}\\. {escape_md(d['code'])} — "
-            f"EV: {ev} \\| "
-            f"🏆{d['top3']:.0%} \\| "
-            f"⚠️DNF:{d['dnf']:.0%}"
+            code(
+                f"{d['driver_code']:<3} {bar} {d['tokens']}  {grid:<3} "
+                f"pódio {d['top3_probability']:>4.0%}  DNF {d['dnf_probability']:>3.0%}"
+            )
         )
 
-    allocation = analysis.get("allocation", {})
-    if allocation:
+    candidates = strategy.get("eleventh_candidates", [])
+    if candidates:
+        first = candidates[0]
+        others = ", ".join(
+            f"{c['driver_code']} {c['probability']:.0%}" for c in candidates[1:]
+        )
         lines.append("")
-        lines.append("🎯 *STRATEGY*")
-        lines.append(f"  Type: {escape_md(analysis.get('strategy_type', 'balanced'))}")
-        for code, tokens in allocation.items():
-            bar = "●" * tokens + "○" * (5 - tokens)
-            lines.append(f"  {escape_md(code)}: \\[{escape_md(bar)}\\] {tokens}T")
+        chance = escape_md(f"{first['probability']:.0%}")
+        lines.append(
+            f"🔢 *11º lugar:* {escape_md(first['driver_code'])} \\({chance}\\)"
+        )
+        if others:
+            lines.append(escape_md(f"   alternativas: {others}"))
+    history = strategy.get("eleventh_history", [])
+    if history:
+        record = ", ".join(f"{h['driver_code']} {h['times']}×" for h in history)
+        lines.append(escape_md(f"   quem mais chegou em 11º no ano: {record}"))
 
-    insights = analysis.get("insights", [])
+    lines.append("")
+    expected = f"{strategy.get('total_ev', 0):.0f} de {strategy.get('max_score', 0):.0f}"
+    lines.append(f"📊 Esperado: *{escape_md(expected)}* pontos")
+    if rng.get("p10") is not None:
+        lines.append(
+            escape_md(f"   faixa provável das fichas: {rng['p10']:.0f} a {rng['p90']:.0f}")
+        )
+
+    if strategy.get("constraint_errors"):
+        lines.append("")
+        lines.append("⚠️ " + escape_md("; ".join(strategy["constraint_errors"])))
+
+    if pool:
+        lines.append("")
+        bet = pool.get("current_bet")
+        if bet:
+            mine = ", ".join(
+                f"{a.get('driver', '?').split()[-1]} {a.get('chips', '?')}"
+                for a in bet.get("allocations", [])
+            )
+            lines.append("🗳 *Sua aposta no site:* " + escape_md(mine))
+            if bet.get("eleventh_driver"):
+                lines.append(escape_md(f"   11º: {bet['eleventh_driver']}"))
+        elif pool.get("is_open"):
+            lines.append("🗳 Você ainda *não apostou* nesta prova no site\\.")
+
+    insights = strategy.get("insights", [])
     if insights:
         lines.append("")
-        lines.append("💡 *INSIGHTS*")
-        for insight in insights:
-            lines.append(f"  • {escape_md(insight)}")
-
+        lines.extend(f"• {escape_md(i)}" for i in insights)
     return "\n".join(lines)
 
 
-def format_bet_confirmation(bet: dict, allocation: dict) -> str:
-    """Format a bet confirmation receipt."""
+def format_field(strategy: dict, limit: int = 22) -> str:
+    """The simulated finishing order for the whole field."""
+    race = strategy.get("race", {})
     lines = [
-        "━━━━━━━━━━━━━━━━━",
-        "✅ *BET CONFIRMED*",
-        "━━━━━━━━━━━━━━━━━",
-        f"Strategy: {escape_md(bet.get('strategy_type', 'balanced'))}",
-        f"EV: {bet.get('expected_value', 0):.2f}",
+        f"🎲 *{escape_md(race.get('name', 'Corrida'))}* — simulação",
+        escape_md(f"{strategy.get('n_simulations', 0):,} corridas simuladas".replace(",", ".")),
         "",
+        code("    pil  grid  vit  pódio  top10  11º  DNF"),
     ]
-
-    for code, tokens in allocation.items():
-        bar = "●" * tokens + "○" * (5 - tokens)
-        lines.append(f"  {escape_md(code)}: \\[{escape_md(bar)}\\] {tokens}T")
-
-    lines.append(f"\nConfirmed at: {escape_md(bet.get('confirmed_at', 'now'))}")
-    return "\n".join(lines)
-
-
-def format_leaderboard(users: list[dict]) -> str:
-    """Format the user leaderboard."""
-    lines = [
-        "━━━━━━━━━━━━━━━━━",
-        "🏆 *BF1 LEADERBOARD*",
-        "━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    medals = ["🥇", "🥈", "🥉"]
-    for i, u in enumerate(users):
-        medal = medals[i] if i < 3 else f"  {i + 1}\\."
+    for i, d in enumerate(strategy.get("field", [])[:limit], 1):
+        grid = f"P{d['grid_position']}" if d.get("grid_position") else "–"
         lines.append(
-            f"{medal} {escape_md(u.get('name', 'User'))} \\| "
-            f"{u.get('points', 0):.1f} pts"
+            code(
+                f"{i:>2}  {d['driver_code']:<3}  {grid:<4} {d['win_probability']:>4.0%} "
+                f"{d['top3_probability']:>5.0%} {d['top10_probability']:>6.0%} "
+                f"{d['eleventh_probability']:>4.0%} {d['dnf_probability']:>4.0%}"
+            )
+        )
+    pit = strategy.get("pit_stop_projection") or {}
+    if pit.get("label"):
+        lines.append("")
+        lines.append(f"🛞 Estratégia provável: *{escape_md(pit['label'])}*")
+    return "\n".join(lines)
+
+
+def format_classification(standings: dict) -> str:
+    """The pool's classification, with the participant's row and gaps."""
+    entries = standings.get("entries", [])
+    me = standings.get("me")
+    lines = [
+        f"🏆 *Classificação BF1 {escape_md(standings.get('season', ''))}*",
+        escape_md("pontos válidos (com descarte provisório)")
+        if standings.get("discard_active")
+        else escape_md("pontos totais"),
+        "",
+    ]
+    for e in entries:
+        mark = "▶" if me is not None and e is me else " "
+        name = str(e.get("participant", "?"))
+        short = name if len(name) <= 18 else name[:17] + "…"
+        lines.append(
+            code(
+                f"{mark}{e.get('position', '?'):>2} {short:<18} "
+                f"{e.get('valid_total', e.get('total', 0)):>6.0f}  11º×{e.get('eleventh_hits', 0)}"
+            )
         )
 
+    if me is not None and entries:
+        mine = me.get("valid_total", me.get("total", 0))
+        lines.append("")
+        points = escape_md(f"{mine:.0f}")
+        lines.append(
+            f"📍 Você está em *{escape_md(me.get('position', '?'))}º* com {points} pontos"
+        )
+        ahead = [e for e in entries if e.get("position", 0) < me.get("position", 0)]
+        if ahead:
+            nxt = ahead[-1]
+            gap = nxt.get("valid_total", 0) - mine
+            lines.append(
+                escape_md(f"   {gap:.0f} atrás do {nxt.get('position')}º ({nxt.get('participant')})")
+            )
+            podium = next((e for e in entries if e.get("position") == 3), None)
+            if podium is not None and me.get("position", 0) > 3:
+                lines.append(
+                    escape_md(f"   {podium.get('valid_total', 0) - mine:.0f} atrás do pódio (3º)")
+                )
+        behind = [e for e in entries if e.get("position", 0) > me.get("position", 0)]
+        if behind:
+            lines.append(
+                escape_md(f"   {mine - behind[0].get('valid_total', 0):.0f} à frente do {behind[0].get('position')}º")
+            )
     return "\n".join(lines)
 
 
-def format_simulation_result(sim_results: dict) -> str:
-    """Format Monte Carlo simulation results."""
-    lines = [
-        "━━━━━━━━━━━━━━━━━",
-        "🎲 *SIMULATION RESULTS*",
-        "━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    sorted_drivers = sorted(
-        sim_results.items(),
-        key=lambda x: x[1].get("avg_position", 20),
-    )
-
-    for code, data in sorted_drivers[:10]:
-        pos = data.get("avg_position", 20)
-        top3 = data.get("top3_probability", 0)
-        lines.append(
-            f"  {escape_md(code)}: P{pos:.1f} \\| Top3: {top3:.0%}"
-        )
-
+def format_local_leaderboard(users: list) -> str:
+    """Scores of the bets recorded through this bot (not the pool's table)."""
+    lines = ["🏆 *Apostas registradas neste bot*", ""]
+    if not users:
+        lines.append("_Nenhuma aposta registrada ainda\\._")
+        return "\n".join(lines)
+    for i, u in enumerate(users, 1):
+        name = u.username or f"User {u.telegram_id}"
+        lines.append(code(f"{i:>2} {name[:18]:<18} {u.total_points:>7.1f}  ({u.total_bets} apostas)"))
     return "\n".join(lines)
 
 
 def format_alert_message(alert_type: str, data: dict) -> str:
     """Format an alert message."""
+    name = escape_md(data.get("race_name", "Corrida"))
     if alert_type == "race_24h":
         return (
-            f"⏰ *RACE IN 24 HOURS*\n\n"
-            f"🏎 {escape_md(data.get('race_name', 'Race'))}\n"
-            f"Don't forget to place your bets\\! Use /bet"
+            f"⏰ *FALTAM 24 HORAS*\n\n🏎 {name}\n"
+            "Veja a aposta recomendada com /analysis"
         )
-    elif alert_type == "race_1h":
+    if alert_type == "race_1h":
         return (
-            f"🚨 *LAST CHANCE \\- 1 HOUR*\n\n"
-            f"🏎 {escape_md(data.get('race_name', 'Race'))}\n"
-            f"Betting closes soon\\! Use /bet NOW"
+            f"🚨 *ÚLTIMA HORA*\n\n🏎 {name}\n"
+            "As apostas fecham na largada\\. /analysis"
         )
-    elif alert_type == "weather":
-        return (
-            f"⚠️ *WEATHER ALERT*\n\n"
-            f"Rain probability: {data.get('rain_probability', 0):.0%}\n"
-            f"Consider reviewing your strategy\\! Use /analysis"
-        )
-    elif alert_type == "result":
-        return (
-            f"🏁 *RACE RESULT*\n\n"
-            f"🏎 {escape_md(data.get('race_name', 'Race'))}\n"
-            f"Your points: {data.get('points', 0):.1f}\n"
-            f"Check /leaderboard for standings"
-        )
+    if alert_type == "weather":
+        rain = escape_md(f"{data.get('rain_probability', 0):.0%}")
+        return f"⚠️ *ALERTA DE CLIMA*\n\nChance de chuva: {rain}\nReveja com /analysis"
+    if alert_type == "result":
+        points = escape_md(f"{data.get('points', 0):.1f}")
+        return f"🏁 *RESULTADO*\n\n🏎 {name}\nSua pontuação: {points}\n/classificacao"
     return escape_md(str(data))
-
-
-def ascii_bar_chart(data: dict[str, float], width: int = 30) -> str:
-    """Generate a simple ASCII bar chart."""
-    if not data:
-        return ""
-    max_val = max(data.values()) if data.values() else 1
-    lines = []
-    for label, value in data.items():
-        bar_len = int((value / max_val) * width) if max_val > 0 else 0
-        bar = "█" * bar_len + "░" * (width - bar_len)
-        lines.append(f"{label:>5}: {bar} {value:.1f}")
-    return "\n".join(lines)

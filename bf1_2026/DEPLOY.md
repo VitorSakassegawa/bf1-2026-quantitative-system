@@ -1,7 +1,11 @@
 # Deploying BF1-2026
 
-Runbook for a fresh deploy or a redeploy after the 2026 review. Every command
-runs from the `bf1_2026/` directory on the server.
+Runbook for a fresh deploy, and for moving an existing install to the current
+version. Every command runs from the `bf1_2026/` directory on the server.
+
+**Upgrading from an older version?** Read *Upgrading an existing install* at
+the end first — the short version is: rebuild the image and recreate the
+database, it only holds data that is re-downloaded in a minute.
 
 ---
 
@@ -69,140 +73,187 @@ without removing your keys.
 
 ---
 
+### The pool site (optional, recommended)
+
+```bash
+POOL_BASE_URL=https://<the pool's address>     # exact, no trailing slash
+POOL_EMAIL=<your login on the pool>
+POOL_PASSWORD=<your password on the pool>
+```
+
+With these set the bot reads the pool's JSON API — the same one the pool's own
+pages use — for the real standings (`/classificacao`), the betting deadline as
+the pool has it, the live rules, and the bet you have already placed. It is
+strictly read-only: nothing here ever submits or changes a bet.
+
+The deadline matters more than it looks. The pool closes bets at *its* time for
+each race, which is not always the official start: its 2026 Qatar entry is
+three hours earlier. `/analysis` shows the pool's deadline once this is
+configured.
+
+These are real credentials for a real account, in a plain-text file. Keep
+`.env` out of version control (it is git-ignored and docker-ignored) and
+readable only by you: `chmod 600 .env`.
+
+---
+
 ## 2. Build and start
 
 ```bash
 docker compose up -d --build
 ```
 
-`.dockerignore` now keeps `.env` out of the image. If you built before this
-change, rebuild — the old image has your secrets baked into a layer.
+`.dockerignore` keeps `.env` out of the image.
+
+If a build ever fails at `pip install` with `ResolutionImpossible`, you are on
+an old `requirements.txt`: it pinned `httpx==0.28.0`, which
+`python-telegram-bot` does not accept, so the file could not be installed at
+all. The current one resolves.
 
 ---
 
 ## 3. Apply the database schema
 
-The schema is owned by Alembic. `alembic.ini` now lives at the project root, so
-this works from `/app`:
-
 ```bash
 docker exec bf1_api alembic upgrade head
+docker exec bf1_api alembic current      # should print e752dac48b63 (head)
 ```
 
-Verify:
-
-```bash
-docker exec bf1_api alembic current      # should print a revision, not blank
-```
-
-The API no longer creates tables in production. On boot it checks the schema
-and logs the current revision; if it cannot, it logs an error telling you to
-run the upgrade. It will not silently serve a tableless database.
+The schema is owned by Alembic. The API does not create tables in production;
+on boot it logs the schema revision, or an error telling you to run the
+upgrade.
 
 ---
 
-## 4. Load the 2026 season
+## 4. Load data
 
 ```bash
-docker exec bf1_api python -m scripts.seed
+docker exec bf1_api python -m scripts.pipeline
 ```
 
-Expected: `Seed complete: 11 teams, 22 drivers, 22 new 2026 races`.
+One command: it seeds a starting grid and calendar, syncs every season of the
+current regulation era plus the previous few from the results API
+(`api.jolpi.ca`), and builds ratings and KPIs. Expect about three minutes and roughly
+180 API requests — well inside the API's 500-per-hour limit.
 
-This is safe to re-run — it updates existing rows rather than duplicating, and
-the new unique constraints (`uq_races_season_round`, `uq_race_results_race_driver`,
-and the rest) now enforce that at the database level.
+The pipeline is a **sync**, so it is also how you refresh: run it again at any
+time. It fills in finished rounds that are missing, follows calendar changes
+(2026 gained a 23rd round mid-season), and rewrites the active roster from the
+latest entry list. `--refresh` re-downloads rounds that are already stored.
+
+Lines worth recognising in the output:
+
+- `Synced 2026: 23 rounds on the calendar, 20 new result sets, 6 sprints …`
+- `Roster synced from 2026 R20 Brazilian Grand Prix: 22 active drivers`
+- `regulation era boundary — regressed ELO 50% toward 1500` — once, at 2025→2026.
 
 ---
 
-## 5. Ingest history and build intelligence
-
-```bash
-docker exec bf1_api python -m scripts.pipeline 2022 2026
-```
-
-Starting at **2022** is deliberate: 2026 is a regulation reset, and the KPI
-layer scopes to the current era anyway. Ingesting further back mostly adds rows
-the model will down-weight or ignore.
-
-This runs seed → ingest → ELO/KPI build → model training. It talks to
-`api.jolpi.ca` (the Ergast successor — `ergast.com` was frozen after 2024), so
-the server needs outbound HTTPS to that host.
-
-Watch for these in the logs:
-
-- `Truncated response from ...` — raise `PAGE_LIMIT` in `f1_api_fallback.py`.
-- `no results returned — leaving it un-ingested` — a transient failure. Re-run
-  the pipeline; that round will be retried rather than being permanently
-  skipped.
-- `regulation era boundary — regressed ELO 50% toward 1500` — expected once, on
-  the 2025→2026 transition.
-
----
-
-## 6. Verify
+## 5. Verify
 
 ```bash
 docker exec bf1_api python -m scripts.healthcheck
 ```
 
-All checks should pass. `Historical results ingested` failing means step 5 did
-not reach the data source.
+Every line should be `PASS` (the pool lines are `SKIP` if you did not configure
+it). The checks that catch the failures this system has actually had:
 
-Then confirm the API actually serves data — this is the check that matters most
-after the review, because the previous build returned **500 on every
-database-backed endpoint** while `/health` stayed green:
+- `2026 results are up to date — 20 of 20 completed rounds stored`. Older
+  versions never stored a single result of the season in progress.
+- `One driver per team` and `Bet passes the pool's own validation`.
+- `Pool site readable — 17 participants, you are Nº`.
+- `Pool rules match the engine's defaults`. If the pool's rules ever change,
+  this turns into a `SKIP` saying the live rules will be used instead.
+
+Then ask the engine how it has been doing:
 
 ```bash
-curl -fsS https://yourdomain.com/health
-curl -fsS https://yourdomain.com/api/v1/races/ | head -c 400
+docker exec bf1_api python -m scripts.backtest 2026
 ```
 
-`/api/v1/races/` must return a JSON array of 22 races. A 500 here means the
-deploy did not pick up the new code.
+and message the bot: `/analysis`, `/classificacao`.
 
-Check the guards are live:
+If the API is exposed beyond your own network, also confirm the guards:
 
 ```bash
-# expect 401
-curl -s -o /dev/null -w '%{http_code}\n' -X POST https://yourdomain.com/api/v1/drivers/
-# expect 200
-curl -s -o /dev/null -w '%{http_code}\n' -H "X-Admin-Key: $ADMIN_API_KEY" \
-  https://yourdomain.com/api/v1/admin/dashboard
-# expect 404 — docs must not be public
-curl -s -o /dev/null -w '%{http_code}\n' https://yourdomain.com/docs
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://<host>:8000/api/v1/drivers/   # 401
+curl -s -o /dev/null -w '%{http_code}\n' http://<host>:8000/docs                      # 404
 ```
 
 ---
 
-## 7. Ongoing
+## 6. Race-weekend routine
 
-The scheduler runs in its own container (`bf1_scheduler`) and is no longer
-started inside the API as well — that made every job fire twice. All times UTC:
+Nothing to run by hand — the scheduler container does it — but this is what
+happens and when to look:
 
-| Job | Schedule | What it does |
+1. **After qualifying**, `refresh_grid` (every 20 minutes on a race weekend)
+   stores the official starting grid from formula1.com as soon as it is
+   published. Until then `/analysis` says the grid is *provisório* or the
+   *ordem da classificação*.
+2. **Run `/analysis` once the grid is official.** The grid is the model's main
+   input; a recommendation made before qualifying is a rough first look.
+3. **Place the bet on the pool site** before the deadline `/analysis` shows.
+4. **After the race**, the twice-daily data update pulls the result, rebuilds
+   the ratings and scores any bet you recorded with `/bet`.
+
+To force any of it: `POST /api/v1/admin/refresh-grid`, `/update-data`,
+`/settle-bets`, or run `python -m scripts.pipeline` again.
+
+| Job | Schedule (UTC) | What it does |
 |---|---|---|
-| `daily_data_update` | 02:00 daily | Ingests finished races, rebuilds ELO and KPIs |
+| `daily_data_update` | 02:00, 14:00 | Sync results, rebuild ratings, settle bets, sync pool deadlines |
+| `refresh_grid` | every 20 min, within 3 days of a race | Official starting grid |
+| `check_race_alerts` | every 30 min | 24 h and 1 h Telegram reminders |
 | `update_weather` | 08:00 daily | Forecasts for races within 7 days |
-| `check_race_alerts` | every 30 min | 24h and 1h Telegram reminders |
-| `weekly_retrain` | Mon 03:00 | Full model retrain |
 
-To run the API and scheduler in one process instead, set
-`RUN_SCHEDULER_IN_API=true` and do not start the scheduler container.
+The scheduler runs in its own container (`bf1_scheduler`). To run it inside the
+API process instead, set `RUN_SCHEDULER_IN_API=true` and do not start that
+container.
+
+---
+
+## Upgrading an existing install
+
+The database holds nothing that cannot be re-downloaded (results, ratings,
+KPIs) plus any bets recorded through the bot. The schema gained stable
+identifiers and per-result team attribution, and older installs created their
+tables without Alembic, so the clean path is to recreate it:
+
+```bash
+git pull
+docker compose down
+docker volume ls | grep postgres           # find the Postgres volume's name
+docker volume rm <that volume>             # drops the old database
+docker compose up -d --build               # rebuild: dependencies changed
+docker exec bf1_api alembic upgrade head
+docker exec bf1_api python -m scripts.pipeline
+docker exec bf1_api python -m scripts.healthcheck
+```
+
+Then add the `POOL_*` settings to `.env` (section 1) and restart the bot:
+`docker compose up -d bf1_bot`.
+
+What changes for you after the upgrade:
+
+- The recommended bet is **5-5-3-1-1 on five teams plus an 11th-place pick**.
+  The old default spread chips over six or seven drivers and had no 11th-place
+  pick at all.
+- `/classificacao` shows the pool's real table. `/leaderboard` still works as
+  an alias.
+- `/calendar` shows the real calendar. It used to be a hand-typed list with
+  the wrong races.
 
 ---
 
 ## Still open
 
-Not addressed by this deploy — see the review for detail:
-
-- **Training has look-ahead bias.** Features use current aggregates and the
-  scaler is fitted before the time split, so reported metrics are optimistic.
-  The Monte Carlo layer does not depend on the trained model.
-- **Team KPIs follow the current roster.** `RaceResult` has no `team_id`, so a
-  driver's history is attributed to whichever team they drive for now.
-- **`POST /bets` is API-only.** The Telegram bot writes to the database
-  directly and does not go through it.
+- **Sprint weekends have no dedicated bot flow yet.** The engine, the rules and
+  the API (`?sprint=true`) handle a sprint as its own event; the bot switches
+  to it when the pool's open event is a sprint, but that path has only been
+  exercised on past data — 2026 has no sprint left to try it live.
+- **Recorded bets cover the race only**, not the sprint.
+- **The XGBoost model is unused.** It is kept as an experiment; see the README.
 
 ---
 
@@ -213,5 +264,5 @@ docker exec bf1_api alembic downgrade -1
 git checkout <previous-tag> && docker compose up -d --build
 ```
 
-The initial migration drops its enum types on downgrade, so
-downgrade-then-upgrade is clean; verified over three cycles.
+Both migrations reverse cleanly (verified over repeated upgrade/downgrade
+cycles).

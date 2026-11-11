@@ -28,8 +28,9 @@ WRITE_ROUTES = [
 ADMIN_ROUTES = [
     ("get", "/api/v1/admin/dashboard"),
     ("post", "/api/v1/admin/recalculate-elo"),
-    ("post", "/api/v1/admin/retrain-model"),
     ("post", "/api/v1/admin/update-data"),
+    ("post", "/api/v1/admin/refresh-grid"),
+    ("post", "/api/v1/admin/settle-bets"),
 ]
 
 

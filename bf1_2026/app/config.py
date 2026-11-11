@@ -52,6 +52,18 @@ class Settings(BaseSettings):
     # schema advertises the admin surface to anonymous visitors.
     enable_docs: bool = Field(default=False)
 
+    # The betting pool's site (read-only: standings, deadlines, rules, my
+    # bets). All three must be set for the pool features to switch on.
+    pool_base_url: str = Field(default="")
+    pool_email: str = Field(default="")
+    pool_password: str = Field(default="")
+    # The name the pool knows you by, to highlight your row in the standings.
+    # Left empty it is taken from the pool's own profile for the account.
+    pool_participant_name: str = Field(default="")
+
+    # Time zone used when the bot shows a date or a deadline.
+    display_timezone: str = Field(default="America/Sao_Paulo")
+
     # ML
     models_storage_path: str = Field(default="/app/models_storage")
     monte_carlo_simulations: int = Field(default=20000)

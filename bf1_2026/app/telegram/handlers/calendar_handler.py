@@ -1,85 +1,68 @@
-"""Calendar handler – show the 2026 race calendar."""
+"""Calendar handler – the season's calendar, read from the database."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from loguru import logger
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from sqlalchemy import func, select
+from telegram import Update
 from telegram.ext import ContextTypes
 
-
-# 2026 F1 Calendar (placeholder – updated when real calendar is available)
-CALENDAR_2026 = [
-    {"round": 1, "name": "Australian GP", "date": "2026-03-15", "sprint": False},
-    {"round": 2, "name": "Chinese GP", "date": "2026-03-29", "sprint": True},
-    {"round": 3, "name": "Japanese GP", "date": "2026-04-05", "sprint": False},
-    {"round": 4, "name": "Bahrain GP", "date": "2026-04-19", "sprint": False},
-    {"round": 5, "name": "Saudi Arabian GP", "date": "2026-04-26", "sprint": False},
-    {"round": 6, "name": "Miami GP", "date": "2026-05-10", "sprint": True},
-    {"round": 7, "name": "Emilia Romagna GP", "date": "2026-05-24", "sprint": False},
-    {"round": 8, "name": "Monaco GP", "date": "2026-05-31", "sprint": False},
-    {"round": 9, "name": "Spanish GP", "date": "2026-06-14", "sprint": False},
-    {"round": 10, "name": "Canadian GP", "date": "2026-06-28", "sprint": False},
-    {"round": 11, "name": "Austrian GP", "date": "2026-07-05", "sprint": True},
-    {"round": 12, "name": "British GP", "date": "2026-07-19", "sprint": False},
-    {"round": 13, "name": "Belgian GP", "date": "2026-07-26", "sprint": False},
-    {"round": 14, "name": "Hungarian GP", "date": "2026-08-02", "sprint": False},
-    {"round": 15, "name": "Dutch GP", "date": "2026-08-30", "sprint": False},
-    {"round": 16, "name": "Italian GP", "date": "2026-09-06", "sprint": False},
-    {"round": 17, "name": "Azerbaijan GP", "date": "2026-09-20", "sprint": True},
-    {"round": 18, "name": "Singapore GP", "date": "2026-10-04", "sprint": False},
-    {"round": 19, "name": "US GP", "date": "2026-10-18", "sprint": True},
-    {"round": 20, "name": "Mexican GP", "date": "2026-10-25", "sprint": False},
-    {"round": 21, "name": "Brazilian GP", "date": "2026-11-08", "sprint": True},
-    {"round": 22, "name": "Las Vegas GP", "date": "2026-11-22", "sprint": False},
-    {"round": 23, "name": "Qatar GP", "date": "2026-11-29", "sprint": False},
-    {"round": 24, "name": "Abu Dhabi GP", "date": "2026-12-06", "sprint": False},
-]
+from app.database import AsyncSessionLocal
+from app.models.race import Race, RaceStatus
+from app.telegram.formatters import code, escape_md, local_time
 
 
 async def calendar_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle /calendar – display the 2026 race calendar."""
+    """Handle /calendar.
+
+    The calendar used to be a list typed into this file, and it had drifted
+    into fiction: 24 rounds including an Imola race, with most dates wrong.
+    It now shows the races in the database, which the results sync keeps in
+    step with the real calendar.
+    """
     if update.effective_message is None:
         return
-
     logger.info(f"/calendar from {update.effective_user}")
     now = datetime.now(timezone.utc)
 
-    lines = ["🏎 *F1 2026 CALENDAR*\n"]
+    async with AsyncSessionLocal() as session:
+        season = await session.scalar(
+            select(func.max(Race.season)).where(Race.season <= now.year)
+        )
+        races = (
+            await session.execute(
+                select(Race).where(Race.season == season).order_by(Race.round_number)
+            )
+        ).scalars().all()
+
+    if not races:
+        await update.effective_message.reply_text(
+            "Calendário vazio. Rode: docker exec bf1_api python -m scripts.pipeline"
+        )
+        return
+
+    lines = [f"🏎 *Calendário F1 {escape_md(season)}*", ""]
     next_found = False
-
-    for race in CALENDAR_2026:
-        race_date = datetime.strptime(race["date"], "%Y-%m-%d").replace(
-            tzinfo=timezone.utc
-        )
-        sprint_tag = " 🟡 Sprint" if race["sprint"] else ""
-
-        if race_date < now:
-            icon = "🔵"
+    for race in races:
+        start = race.race_date if race.race_date.tzinfo else race.race_date.replace(tzinfo=timezone.utc)
+        if race.status == RaceStatus.cancelled:
+            icon = "✖"
+        elif start < now:
+            icon = "✓"
         elif not next_found:
-            icon = "🟢"
+            icon = "▶"
             next_found = True
-            days_until = (race_date - now).days
-            sprint_tag += f" \\({days_until}d\\)"
         else:
-            icon = "⚪"
-
-        line = (
-            f"{icon} R{race['round']:02d} \\| "
-            f"{_esc(race['date'])} \\| "
-            f"{_esc(race['name'])}{_esc(sprint_tag)}"
+            icon = " "
+        name = race.race_name.replace(" Grand Prix", "")[:22]
+        sprint = " S" if race.is_sprint_weekend else ""
+        lines.append(
+            code(f"{icon} R{race.round_number:02d} {local_time(start, '%d/%m %H:%M')}  {name}{sprint}")
         )
-        lines.append(line)
-
-    await update.effective_message.reply_text(
-        "\n".join(lines), parse_mode="MarkdownV2"
-    )
-
-
-def _esc(text: str) -> str:
-    """Escape MarkdownV2 special chars."""
-    special = r"_*[]()~`>#+-=|{}.!"
-    return "".join(f"\\{c}" if c in special else c for c in text)
+    lines.append("")
+    lines.append(escape_md("▶ próxima · S = fim de semana com sprint · horário de Brasília"))
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="MarkdownV2")

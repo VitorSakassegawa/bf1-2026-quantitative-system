@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System dependencies (needed for PyMC / scipy / psycopg2)
+# System dependencies (compilers for any wheel that has to build; libpq)
 RUN apt-get update && apt-get install -y \
     gcc g++ libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*

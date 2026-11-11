@@ -61,22 +61,29 @@ async def run_simulation(
 
     from app.services.strategy_service import build_strategy
 
-    strategy = await build_strategy(db, race, n_simulations=n_sims)
+    strategy = await build_strategy(
+        db, race, n_simulations=n_sims, sprint=bool(sim_req and sim_req.sprint)
+    )
+    tokens = strategy.get("allocation", {})
+    # The whole field, not just the drivers that received chips.
     driver_results = {
         d["driver_code"]: {
+            "grid_position": d["grid_position"],
             "expected_position": d["expected_position"],
+            "expected_points": d["expected_points"],
+            "win_probability": d["win_probability"],
             "top3_probability": d["top3_probability"],
             "top10_probability": d["top10_probability"],
+            "eleventh_probability": d["eleventh_probability"],
             "dnf_probability": d["dnf_probability"],
-            "tokens": d["tokens"],
-            "expected_value": d["expected_value"],
+            "tokens": tokens.get(d["driver_id"], 0),
         }
-        for d in strategy.get("driver_details", [])
+        for d in strategy.get("field", [])
     }
     return SimulationResponse(
         race_id=race.id,
-        n_simulations=n_sims,
-        model_version="monte_carlo+xgboost",
+        n_simulations=strategy.get("n_simulations", n_sims),
+        model_version="race_model-2026.11 (grid-anchored simulation)",
         driver_results=driver_results,
         run_at=datetime.now(timezone.utc),
     )

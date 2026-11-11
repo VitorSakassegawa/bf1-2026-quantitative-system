@@ -16,21 +16,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"/start from {user.username} ({user.id})")
 
     welcome = (
-        f"Welcome to *BF1\\-2026 Quantitative System*, {_escape_md(user.first_name)}\\!\n"
+        f"Olá, {_escape_md(user.first_name)}\\! Sou o assistente do *BF1\\-2026*\\.\n"
         "\n"
-        "I'm your AI\\-powered F1 betting assistant\\. "
-        "I analyze race data, run Monte Carlo simulations, "
-        "and optimize your 15\\-token allocation\\.\n"
+        "Simulo a corrida a partir do grid de largada e monto a aposta de maior "
+        "pontuação esperada pelas regras do bolão: 15 fichas, um piloto por "
+        "equipe, e o palpite do 11º lugar\\.\n"
         "\n"
-        "*Available Commands:*\n"
-        "/calendar \\- 2026 Race Calendar\n"
-        "/analysis \\- Race Analysis \\(next race\\)\n"
-        "/simulate \\- Run Monte Carlo Simulation\n"
-        "/bet \\- Place Your Token Allocation\n"
-        "/leaderboard \\- User Rankings\n"
-        "/settings \\- Your Preferences\n"
+        "*Comandos*\n"
+        "/analysis \\- aposta recomendada para a próxima prova\n"
+        "/simulate \\- chances de cada piloto \\(vitória, pódio, 11º, abandono\\)\n"
+        "/classificacao \\- classificação do bolão e sua posição\n"
+        "/calendar \\- calendário da temporada\n"
+        "/bet \\- registrar a aposta recomendada para apurar depois\n"
+        "/settings \\- perfil de risco\n"
         "\n"
-        "Use /analysis to see the upcoming race breakdown\\!"
+        "O grid de largada é o dado mais importante: rode /analysis de novo "
+        "depois da classificação\\."
     )
 
     await update.effective_message.reply_text(welcome, parse_mode="MarkdownV2")

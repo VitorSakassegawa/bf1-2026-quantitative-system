@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.bet import Bet, BetStatus
+from app.models.bet import Bet, BetStatus, StrategyType
 from app.models.driver import Driver
 from app.models.race import Race
 from app.models.user import User
@@ -54,7 +54,7 @@ async def create_bet(
     if is_bet_deadline_passed(race.race_date, race.deadline_bets):
         raise HTTPException(
             status_code=400,
-            detail="Betting deadline has passed (1h before race)",
+            detail="Betting deadline has passed (bets close at the race start)",
         )
 
     # Enforce the BF1 rules here too. The optimizer produces valid allocations,
@@ -78,14 +78,25 @@ async def create_bet(
     if errors:
         raise HTTPException(status_code=422, detail={"constraint_errors": errors})
 
-    bet = Bet(
-        user_id=user.id,
-        race_id=bet_in.race_id,
-        strategy_type=bet_in.strategy_type,
-        allocations=allocations,
-        confirmed_at=datetime.now(timezone.utc),
-        status=BetStatus.confirmed,
-    )
+    if bet_in.eleventh_driver_id is not None:
+        known = await db.scalar(select(Driver.id).where(Driver.id == bet_in.eleventh_driver_id))
+        if known is None:
+            raise HTTPException(status_code=422, detail="Unknown eleventh_driver_id")
+
+    # As on the pool, a new bet for the same race replaces the earlier one.
+    bet = (
+        await db.execute(select(Bet).where(Bet.user_id == user.id, Bet.race_id == race.id))
+    ).scalar_one_or_none()
+    if bet is None:
+        bet = Bet(user_id=user.id, race_id=bet_in.race_id, allocations={})
+        user.total_bets += 1
+    bet.strategy_type = StrategyType(bet_in.strategy_type)
+    bet.allocations = allocations
+    bet.eleventh_driver_id = bet_in.eleventh_driver_id
+    bet.confirmed_at = datetime.now(timezone.utc)
+    bet.status = BetStatus.confirmed
+    bet.actual_points = None
+    bet.eleventh_hit = None
     db.add(bet)
     await db.flush()
     await db.refresh(bet)

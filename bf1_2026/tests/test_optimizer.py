@@ -177,18 +177,12 @@ class TestEVCalculator:
         ev_sprint = ev_calc.calculate_driver_ev(pred, 3, is_sprint=True)
         assert ev_sprint > ev_normal
 
-    def test_correlation_penalty_same_team(self, ev_calc):
-        alloc = {"d1": 5, "d2": 5, "d3": 3, "d4": 1, "d5": 1}
-        teams = {
-            "d1": "t1", "d2": "t1", "d3": "t2", "d4": "t3", "d5": "t4"
-        }
-        penalty = ev_calc.calculate_correlation_penalty(alloc, teams)
-        assert penalty > 0
+    def test_retirement_penalty_is_flat_not_per_chip(self, ev_calc):
+        """The pool charges -10 once per retired driver, whatever the chips."""
+        pred = {"expected_points": 0.0, "dnf_probability": 1.0}
+        assert ev_calc.calculate_driver_ev(pred, 1) == pytest.approx(-10.0)
+        assert ev_calc.calculate_driver_ev(pred, 5) == pytest.approx(-10.0)
 
-    def test_no_penalty_different_teams(self, ev_calc):
-        alloc = {"d1": 5, "d2": 4, "d3": 3, "d4": 2, "d5": 1}
-        teams = {
-            "d1": "t1", "d2": "t2", "d3": "t3", "d4": "t4", "d5": "t5"
-        }
-        penalty = ev_calc.calculate_correlation_penalty(alloc, teams)
-        assert penalty == 0.0
+    def test_unpicked_driver_costs_nothing(self, ev_calc):
+        pred = {"expected_points": 12.0, "dnf_probability": 0.5}
+        assert ev_calc.calculate_driver_ev(pred, 0) == 0.0

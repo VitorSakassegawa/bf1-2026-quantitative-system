@@ -5,10 +5,12 @@ logged its length, `check_race_alerts` was `pass`, `update_weather` constructed
 a collector and closed it, and `weekly_retrain` built a model object and logged
 "completed" without training. The real work sat behind "In production:"
 comments, so the weather table was never populated, no reminder was ever sent,
-and the model was never retrained — while the logs reported success.
+and no new result was ever stored — while the logs reported success.
 
-All four now do the work, and all four are guarded so one failure cannot take
-the scheduler process down.
+The jobs now do the work, and each is guarded so one failure cannot take the
+scheduler process down. There is no model-retraining job any more: predictions
+come from a simulator whose parameters are fixed constants checked by
+`scripts.backtest`, not from a model that needs periodic fitting.
 """
 
 from __future__ import annotations
@@ -63,25 +65,65 @@ async def _subscriber_chat_ids(session) -> list[int]:
     return [int(r[0]) for r in rows if r[0] is not None]
 
 
-@scheduler.scheduled_job("cron", hour=2, minute=0, id="daily_data_update")
+async def run_data_update() -> dict:
+    """Sync the current season, rebuild ratings, settle bets, sync deadlines.
+
+    Shared by the nightly job and the admin "update data" endpoint.
+    """
+    from scripts.build_intelligence import build
+    from scripts.ingest import ingest
+
+    from app.services.pool_service import sync_pool_deadlines
+    from app.services.settlement_service import settle_bets
+
+    season = datetime.now(timezone.utc).year
+    # The sync fills in any finished round that has no stored results and
+    # refreshes the calendar and the active roster.
+    await ingest(season, season)
+    await build()
+    async with AsyncSessionLocal() as session:
+        settled = await settle_bets(session)
+        deadlines = await sync_pool_deadlines(session, season)
+        await session.commit()
+    return {"season": season, "bets_settled": settled, "deadlines_synced": deadlines}
+
+
+@scheduler.scheduled_job("cron", hour="2,14", minute=0, id="daily_data_update")
 async def daily_data_update() -> None:
-    """Daily 02:00 UTC: ingest finished races, then rebuild ELO and KPIs."""
-    logger.info("Starting daily data update job")
+    """02:00 and 14:00 UTC: pull new results and everything derived from them.
+
+    Twice a day so a Sunday race is in by Monday morning whichever side of
+    the world it was run on.
+    """
+    logger.info("Starting data update job")
     try:
-        from scripts.build_intelligence import build
-        from scripts.ingest import ingest
-
-        season = datetime.now(timezone.utc).year
-
-        # ingest() skips rounds already stored and, since the review, refuses
-        # to write a race whose results came back empty — so re-running it is
-        # how new results get picked up.
-        await ingest(season, season)
-        await build()
-
-        logger.info(f"Daily data update completed for season {season}")
+        result = await run_data_update()
+        logger.info(f"Data update completed: {result}")
     except Exception as e:
-        logger.exception(f"Daily data update failed: {e}")
+        logger.exception(f"Data update failed: {e}")
+
+
+@scheduler.scheduled_job("cron", minute="7,27,47", id="refresh_grid")
+async def refresh_grid_job() -> None:
+    """Every 20 minutes on a race weekend: fetch the official starting grid.
+
+    The grid is the model's main input and is only published on formula1.com,
+    a few hours before the start. Outside the three days before a race this
+    does nothing and makes no request.
+    """
+    try:
+        from app.services.grid_service import maybe_refresh_grid
+        from app.services.strategy_service import get_next_or_latest_race
+
+        async with AsyncSessionLocal() as session:
+            race = await get_next_or_latest_race(session)
+            if race is None:
+                return
+            stored = await maybe_refresh_grid(session, race)
+            if stored["race"] or stored["sprint"]:
+                logger.info(f"Starting grid refreshed for {race.race_name}: {stored}")
+    except Exception as e:
+        logger.exception(f"Grid refresh job failed: {e}")
 
 
 @scheduler.scheduled_job("cron", minute="*/30", id="check_race_alerts")
@@ -208,28 +250,12 @@ async def update_weather() -> None:
                 pass
 
 
-@scheduler.scheduled_job("cron", day_of_week="mon", hour=3, id="weekly_retrain")
-async def weekly_model_retrain() -> None:
-    """Monday 03:00 UTC: full model retrain from the ingested history."""
-    logger.info("Starting weekly model retrain")
-    try:
-        from scripts.train_model import train
-
-        # train() builds the dataset, fits position and DNF models, and saves a
-        # versioned artifact via the registry. It logs and returns early when
-        # there are too few rows rather than raising.
-        await train()
-        logger.info("Weekly retrain completed")
-    except Exception as e:
-        logger.exception(f"Weekly retrain failed: {e}")
-
-
 def start_scheduler() -> None:
     """Start the APScheduler."""
     scheduler.start()
     logger.info(
-        "Scheduler started (UTC) with jobs: daily_data_update, "
-        "check_race_alerts, update_weather, weekly_retrain"
+        "Scheduler started (UTC) with jobs: daily_data_update, refresh_grid, "
+        "check_race_alerts, update_weather"
     )
 
 

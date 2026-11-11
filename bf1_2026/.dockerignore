@@ -28,3 +28,4 @@ logs/
 models_storage/
 *.log
 *.sqlite3
+.backtest_cache/

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.optimizer.pool_optimizer import RISK_PROFILES
 from app.utils.security import require_write_key
 from app.models.race import Race
 from app.schemas.race import RaceAnalysis, RaceCreate, RaceResponse
@@ -64,7 +65,7 @@ async def create_race(
         qualifying_date=race_in.qualifying_date,
         sprint_date=race_in.sprint_date,
         is_sprint_weekend=race_in.is_sprint_weekend,
-        deadline_bets=race_in.race_date - timedelta(hours=1),
+        deadline_bets=race_in.race_date,  # the pool takes bets until the start
     )
     db.add(race)
     await db.flush()
@@ -72,35 +73,42 @@ async def create_race(
     return race
 
 
-@router.get("/{race_id}/analysis")
-async def get_race_analysis(
-    race_id: uuid.UUID,
-    aggressiveness: str = "balanced",
-    db: AsyncSession = Depends(get_db),
-):
-    """Get complete data-driven analysis for a race."""
-    result = await db.execute(select(Race).where(Race.id == race_id))
-    race = result.scalar_one_or_none()
+async def _strategy(race_id: uuid.UUID, aggressiveness: str, sprint: bool, db: AsyncSession):
+    if aggressiveness not in RISK_PROFILES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"aggressiveness must be one of {sorted(RISK_PROFILES)}",
+        )
+    race = (await db.execute(select(Race).where(Race.id == race_id))).scalar_one_or_none()
     if race is None:
         raise HTTPException(status_code=404, detail="Race not found")
 
     from app.services.strategy_service import build_strategy
 
-    return await build_strategy(db, race, aggressiveness)
+    return await build_strategy(db, race, aggressiveness, sprint=sprint)
 
 
 @router.get("/{race_id}/strategy")
 async def get_race_strategy(
     race_id: uuid.UUID,
     aggressiveness: str = "balanced",
+    sprint: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the optimal token strategy for a race (full engine pipeline)."""
-    result = await db.execute(select(Race).where(Race.id == race_id))
-    race = result.scalar_one_or_none()
-    if race is None:
-        raise HTTPException(status_code=404, detail="Race not found")
+    """The recommended bet for a race: chips, 11th-place pick, expected score.
 
-    from app.services.strategy_service import build_strategy
+    Pass ``sprint=true`` for the weekend's sprint, which the pool scores as a
+    separate event.
+    """
+    return await _strategy(race_id, aggressiveness, sprint, db)
 
-    return await build_strategy(db, race, aggressiveness)
+
+@router.get("/{race_id}/analysis", deprecated=True)
+async def get_race_analysis(
+    race_id: uuid.UUID,
+    aggressiveness: str = "balanced",
+    sprint: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Alias of ``/strategy`` (the two were always the same implementation)."""
+    return await _strategy(race_id, aggressiveness, sprint, db)

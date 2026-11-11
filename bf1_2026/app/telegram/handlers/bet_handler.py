@@ -1,4 +1,10 @@
-"""Bet handler – real allocation from the engine, persisted to the DB."""
+"""Bet handler – record the recommended bet so it can be scored later.
+
+This does NOT place a bet on the pool's site; that is done by you, there.
+/bet shows the recommendation for the next race and, on confirmation, stores
+it here. After the race the nightly job scores it with the pool's rules, which
+builds a track record of what following the engine would have earned.
+"""
 
 from __future__ import annotations
 
@@ -14,178 +20,142 @@ from app.database import AsyncSessionLocal
 from app.models.bet import Bet, BetStatus, StrategyType
 from app.models.race import Race
 from app.models.user import User
-from app.services.strategy_service import build_strategy, get_next_or_latest_race
-from app.telegram.formatters import escape_md
+from app.telegram.formatters import escape_md, format_strategy
+from app.telegram.handlers.common import NO_DATA_MESSAGE, resolve_race, strategy_for
 from app.utils.validators import is_bet_deadline_passed
 
-BET_SELECT_RACE = 0
-BET_SELECT_STRATEGY = 1
-BET_CONFIRM = 2
-
-BOT_SIMULATIONS = 5000
+BET_SELECT_RACE, BET_SELECT_STRATEGY, BET_CONFIRM = range(3)
 
 
 async def bet_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /bet – pick the upcoming race and offer strategy choices."""
+    """Handle /bet – show the recommended bet and ask whether to record it."""
     if update.effective_message is None:
         return ConversationHandler.END
-
     logger.info(f"/bet from {update.effective_user}")
 
+    profile = (context.user_data or {}).get("aggressiveness", "balanced")
     async with AsyncSessionLocal() as session:
-        race = await get_next_or_latest_race(session)
+        race = await resolve_race(session, [])
+        if race is None:
+            await update.effective_message.reply_text(NO_DATA_MESSAGE)
+            return ConversationHandler.END
+        strategy, pool = await strategy_for(session, race, profile)
 
-    if race is None:
+    if strategy.get("constraint_errors") or not strategy.get("allocation"):
         await update.effective_message.reply_text(
-            "No races yet. Run: docker exec bf1_api python -m scripts.pipeline"
+            "Não foi possível montar uma aposta válida: "
+            + "; ".join(strategy.get("constraint_errors") or ["sem pilotos suficientes"])
         )
         return ConversationHandler.END
 
-    context.user_data["race_id"] = str(race.id)  # type: ignore[index]
-    context.user_data["race_name"] = race.race_name  # type: ignore[index]
-
+    pick = strategy.get("eleventh_pick") or {}
+    context.user_data.update(  # type: ignore[union-attr]
+        {
+            "race_id": strategy["race"]["id"],
+            "allocation": dict(strategy["allocation"]),
+            "eleventh": pick.get("driver_id"),
+            "expected_value": strategy.get("total_ev", 0.0),
+            "strategy": strategy.get("strategy_type", profile),
+        }
+    )
     keyboard = [
-        [InlineKeyboardButton("Conservative", callback_data="strat_conservative")],
-        [InlineKeyboardButton("Balanced (Recommended)", callback_data="strat_balanced")],
-        [InlineKeyboardButton("Aggressive", callback_data="strat_aggressive")],
-        [InlineKeyboardButton("Ultra Aggressive", callback_data="strat_ultra_aggressive")],
+        [InlineKeyboardButton("Registrar esta aposta", callback_data="confirm_yes")],
+        [InlineKeyboardButton("Cancelar", callback_data="confirm_no")],
     ]
     await update.effective_message.reply_text(
-        f"Race: {race.race_name}\nChoose your strategy:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return BET_SELECT_STRATEGY
-
-
-async def bet_select_race(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Kept for handler-registration compatibility (race auto-selected in bet_start)."""
-    return BET_SELECT_STRATEGY
-
-
-async def bet_select_strategy(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Build the real allocation for the chosen strategy and show it."""
-    query = update.callback_query
-    if query is None:
-        return ConversationHandler.END
-    await query.answer()
-
-    strategy_type = query.data.replace("strat_", "")  # type: ignore[union-attr]
-    context.user_data["strategy"] = strategy_type  # type: ignore[index]
-    race_id = context.user_data.get("race_id")  # type: ignore[union-attr]
-
-    await query.edit_message_text("Optimizing your 15 tokens…")
-
-    async with AsyncSessionLocal() as session:
-        race = (
-            await session.execute(select(Race).where(Race.id == uuid.UUID(race_id)))
-        ).scalar_one_or_none()
-        if race is None:
-            await query.edit_message_text("Race not found.")
-            return ConversationHandler.END
-        strategy = await build_strategy(
-            session, race, aggressiveness=strategy_type, n_simulations=BOT_SIMULATIONS
-        )
-
-    details = strategy.get("driver_details", [])
-    context.user_data["allocation"] = {  # type: ignore[index]
-        d["driver_id"]: d["tokens"] for d in details
-    }
-    context.user_data["expected_value"] = strategy.get("total_ev", 0)  # type: ignore[index]
-
-    lines = [f"Strategy: *{escape_md(strategy_type.upper())}*", ""]
-    for d in sorted(details, key=lambda x: x["tokens"], reverse=True):
-        bar = "●" * d["tokens"] + "○" * (5 - d["tokens"])
-        lines.append(
-            f"  {escape_md(d['driver_code'])}: \\[{escape_md(bar)}\\] {d['tokens']}T"
-        )
-    lines.append("")
-    # Escape the decimal point: an unescaped "." breaks MarkdownV2 parsing and
-    # Telegram rejects the message with 400, so /bet silently dead-ends.
-    total_ev = escape_md(f"{strategy.get('total_ev', 0):.1f}")
-    lines.append(f"Total EV: {total_ev} \\| 15 tokens")
-
-    keyboard = [
-        [InlineKeyboardButton("Confirm", callback_data="confirm_yes")],
-        [InlineKeyboardButton("Cancel", callback_data="confirm_no")],
-    ]
-    await query.edit_message_text(
-        "\n".join(lines),
+        format_strategy(strategy, pool)
+        + "\n\n"
+        + escape_md(
+            "Registrar guarda esta aposta aqui para ser apurada depois da prova. "
+            "A aposta que vale é a que você fizer no site do bolão."
+        ),
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return BET_CONFIRM
 
 
+async def bet_select_race(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kept for handler-registration compatibility; the race is auto-selected."""
+    return BET_CONFIRM
+
+
+async def bet_select_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kept for handler-registration compatibility; there is one recommendation."""
+    return BET_CONFIRM
+
+
 async def bet_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Persist the confirmed bet (enforcing the betting deadline)."""
+    """Store the confirmed bet, replacing an earlier one for the same race."""
     query = update.callback_query
     if query is None:
         return ConversationHandler.END
     await query.answer()
 
     if query.data != "confirm_yes":
-        await query.edit_message_text("Bet cancelled\\.", parse_mode="MarkdownV2")
+        await query.edit_message_reply_markup(reply_markup=None)
         return ConversationHandler.END
 
-    race_id = context.user_data.get("race_id")  # type: ignore[union-attr]
-    allocation = context.user_data.get("allocation", {})  # type: ignore[union-attr]
-    strategy_type = context.user_data.get("strategy", "balanced")  # type: ignore[union-attr]
-    expected_value = context.user_data.get("expected_value", 0)  # type: ignore[union-attr]
+    data = context.user_data or {}
+    race_id, allocation = data.get("race_id"), data.get("allocation") or {}
     tg_user = update.effective_user
+    if not race_id or not allocation or tg_user is None:
+        await query.edit_message_reply_markup(reply_markup=None)
+        return ConversationHandler.END
 
     async with AsyncSessionLocal() as session:
         race = (
             await session.execute(select(Race).where(Race.id == uuid.UUID(race_id)))
         ).scalar_one_or_none()
         if race is None:
-            await query.edit_message_text("Race not found.")
+            await query.edit_message_text("Corrida não encontrada.")
             return ConversationHandler.END
-
         if is_bet_deadline_passed(race.race_date, race.deadline_bets):
-            await query.edit_message_text(
-                "⏰ Betting is closed for this race (deadline is 1h before start)."
-            )
+            await query.edit_message_text("⏰ O prazo desta prova já encerrou.")
             return ConversationHandler.END
 
-        # Find or create the user.
         user = (
-            await session.execute(
-                select(User).where(User.telegram_id == tg_user.id)
-            )
+            await session.execute(select(User).where(User.telegram_id == tg_user.id))
         ).scalar_one_or_none()
         if user is None:
             user = User(telegram_id=tg_user.id, username=tg_user.username)
             session.add(user)
             await session.flush()
 
-        bet = Bet(
-            user_id=user.id,
-            race_id=race.id,
-            strategy_type=StrategyType(strategy_type),
-            allocations=allocation,
-            expected_value=float(expected_value),
-            confirmed_at=datetime.now(timezone.utc),
-            status=BetStatus.confirmed,
-        )
-        session.add(bet)
-        user.total_bets += 1
+        # As on the pool, the last bet before the deadline is the one that counts.
+        bet = (
+            await session.execute(
+                select(Bet).where(Bet.user_id == user.id, Bet.race_id == race.id)
+            )
+        ).scalar_one_or_none()
+        if bet is None:
+            bet = Bet(user_id=user.id, race_id=race.id, allocations={})
+            session.add(bet)
+            user.total_bets += 1
+        try:
+            bet.strategy_type = StrategyType(data.get("strategy", "balanced"))
+        except ValueError:
+            bet.strategy_type = StrategyType.balanced
+        bet.allocations = allocation
+        bet.eleventh_driver_id = uuid.UUID(data["eleventh"]) if data.get("eleventh") else None
+        bet.expected_value = float(data.get("expected_value", 0.0))
+        bet.confirmed_at = datetime.now(timezone.utc)
+        bet.status = BetStatus.confirmed
+        bet.actual_points = None
+        bet.eleventh_hit = None
         await session.commit()
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    logger.info(f"Bet confirmed by {tg_user.id}: {strategy_type} on {race_id}")
-    await query.edit_message_text(
-        f"✅ Bet confirmed at {escape_md(now)}\n"
-        f"Strategy: {escape_md(strategy_type)}\n"
-        f"Good luck\\! 🏎",
-        parse_mode="MarkdownV2",
-    )
+    logger.info(f"Bet recorded by {tg_user.id} on {race_id}")
+    await query.edit_message_reply_markup(reply_markup=None)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "✅ Aposta registrada. Não esqueça de lançar no site do bolão."
+        )
     return ConversationHandler.END
 
 
 async def bet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /cancel during the bet flow."""
     if update.effective_message:
-        await update.effective_message.reply_text("Bet cancelled.")
+        await update.effective_message.reply_text("Cancelado.")
     return ConversationHandler.END

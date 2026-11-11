@@ -103,10 +103,11 @@ class TestClamps:
         assert clamp_position(25, grid_size=20) == 20.0
 
     def test_expected_points_bounds(self):
-        assert clamp_expected_points(999) == 26.0
+        # 25 for a win; the pool has no fastest-lap bonus.
+        assert clamp_expected_points(999) == 25.0
         assert clamp_expected_points(-50) == -10.0
         # Sprint doubles the ceiling
-        assert clamp_expected_points(999, is_sprint=True) == 52.0
+        assert clamp_expected_points(999, is_sprint=True) == 50.0
 
 
 # ---------- Prediction validation ----------

@@ -1,257 +1,168 @@
 # BF1-2026 Quantitative System
 
-A quantitative predictive analysis engine for the BF1-2026 championship, functioning as a trading-style model applied to F1 betting.
-
-## Architecture
+A betting assistant for the BF1 Formula 1 pool. Given a starting grid it
+simulates the race, then recommends the bet with the highest expected score
+under the pool's rules: how to split the 15 chips, and who to name for 11th
+place.
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  Telegram    │────▶│   FastAPI     │────▶│  PostgreSQL  │
-│  Bot         │     │   API         │     │  Database    │
-└─────────────┘     └──────┬───────┘     └─────────────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-       ┌───────────┐ ┌──────────┐ ┌──────────┐
-       │  XGBoost   │ │ Bayesian │ │  Monte   │
-       │  Model     │ │ Model    │ │  Carlo   │
-       └───────────┘ └──────────┘ └──────────┘
-              │            │            │
-              └────────────┼────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │  Token       │
-                    │  Optimizer   │
-                    └─────────────┘
+ results API ─┐                              ┌─ Telegram bot  (/analysis, /classificacao …)
+ (Jolpica)    ├─► Postgres ─► race simulator ─► exact optimiser ─┤
+ formula1.com ┘   form, ELO,   (calibrated on    (pool rules)    └─ REST API
+ (starting grid)  reliability   real results)
+ pool site ───────► rules, deadlines, standings, your bets (read-only)
 ```
 
-**Stack:** Python 3.12 · FastAPI · PostgreSQL · Redis · XGBoost · PyMC · Telegram Bot · Docker
+**Stack:** Python 3.12 · FastAPI · PostgreSQL · NumPy · Telegram Bot · Docker
 
-## BF1-2026 Rules Implemented
+## The pool's rules, as implemented
 
-| Rule | Implementation |
-|------|---------------|
-| 15 total tokens | Hard constraint in optimizer |
-| Max 5 per driver | Hard constraint in optimizer |
-| Min 5 drivers from different teams | Hard constraint in optimizer |
-| Sprint = 2× points | Sprint multiplier in EV calculator |
-| DNF = -10 points | Penalty in Monte Carlo + EV |
-| Fastest lap bonus (+1 if top 10) | Included in points calculation |
-| Betting deadline (1h before race) | Enforced in bet API + bot |
+Encoded once, in `app/rules/pool_rules.py`, from the pool's published
+regulation and the machine-readable rules its API returns. The scorer was
+checked against bets the pool itself scored — 25 of 26 match exactly.
+
+| Rule | |
+|------|--|
+| 15 chips per event, at most 5 on one driver | |
+| At least 5 drivers, **never two from the same team** | |
+| Score | `chips × driver's points + 11th-place bonus − retirement penalties` |
+| Driver's points | 25-18-15-12-10-8-6-4-2-1 (sprint: 8-7-6-5-4-3-2-1) |
+| 11th place | name the driver who finishes 11th: **+50** |
+| Retirement | **−10 per retired driver, flat** — not per chip. A DNS is not penalised |
+| Sprint | a separate event, whole score doubled (maximum 304 vs 332 for a race) |
+| Deadline | bets close at the start of the session |
+| Season | worst event discarded; champion / runner-up / constructor bonuses |
+
+Under these rules the best bet always has the shape **5-5-3-1-1** on five
+drivers of five teams. Spreading chips more thinly lowers the average *and* the
+bad-case score, so the four "risk profiles" almost never change the answer.
+
+## What the model is, and how good it is
+
+`app/models_ml/race_model.py` — a grid-anchored simulation:
+
+```
+score = 0.8·grid + 0.2·recent form − rating/300 + noise (+ occasional incident)
+```
+
+ranked among the cars still running, with retirements drawn from each
+team/driver's own reliability record in the current regulation era. Every
+parameter was fitted on 2023-25 and checked out-of-sample on 2026.
+
+`python -m scripts.backtest 2023 2026` replays 114 real events, asking the
+engine for a bet using only what was known before each start and scoring it
+with the pool's rules:
+
+| | 2026 total (26 events) | 2023-26 per event |
+|--|--:|--:|
+| Pool maximum | 8,464 | 325 |
+| **This engine** | **5,234** | **212.8** |
+| Baseline: bet the starting grid | 5,494 | 213.6 |
+| Previous engine, default profile | 4,356 (chips only) | — |
+| Previous engine, most aggressive | 5,076 (chips only) | — |
+
+Read that honestly: **the starting grid carries almost all of the signal.** No
+model variant beat "bet the grid" by more than one standard error. What the
+engine adds is correctness under the rules (chip shape, one per team, flat
+penalty, reliability, the 11th-place pick) and calibrated probabilities — not
+a secret edge over the grid. The practical consequence is in the bot's own
+advice: re-run `/analysis` after qualifying.
+
+The 11th-place pick is a genuine lottery: the best candidate is right about
+one time in ten.
+
+## Data sources
+
+| Source | Used for | Notes |
+|--------|----------|-------|
+| Jolpica (`api.jolpi.ca`, the Ergast successor) | calendar, results, sprints, qualifying | season-level paginated requests, ~180 for five seasons (limit: 500/hour) |
+| formula1.com | the **official starting grid** before the race | the results API only has it afterwards; URLs resolved from the season index |
+| The pool site | rules, betting deadlines, standings, your own bets | authenticated JSON API, **read-only** — it never places a bet |
+| OpenWeatherMap | forecast (optional) | |
 
 ## Installation
 
-### Local Development
-
 ```bash
-# Clone
-git clone <repo-url>
-cd bf1_2026
-
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy and edit environment variables
-cp .env.template .env
-# Edit .env with your values
-
-# Start services (PostgreSQL + Redis)
-docker compose up -d postgres redis
-
-# Run API
-uvicorn app.main:app --reload --port 8000
-
-# Run Telegram bot (separate terminal)
-python -m app.telegram.bot
-```
-
-### Docker (Production)
-
-```bash
-cp .env.template .env
-# Edit .env with production values
-docker compose up -d
-```
-
-## Configuration (.env)
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection string |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token from BotFather |
-| `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for alerts |
-| `OPENWEATHER_API_KEY` | OpenWeatherMap API key |
-| `SECRET_KEY` | Application secret key |
-| `MONTE_CARLO_SIMULATIONS` | Number of MC simulations (default: 20000) |
-| `DEFAULT_AGGRESSIVENESS` | Default strategy level |
-
-## Deploy on DigitalOcean
-
-```bash
-# On a fresh Ubuntu 24.04 droplet:
-chmod +x deploy/digitalocean_setup.sh
-./deploy/digitalocean_setup.sh
-
-# Then:
-cd /opt/bf1-2026
-git clone <repo-url> .
-cp .env.template .env
-# Edit .env
-docker compose up -d
-```
-
-## Deploy on Synology NAS (Container Manager)
-
-Tested target: DS220+ (Celeron J4025, x86-64), DSM 7.2+, 6 GB+ RAM. The bot
-uses Telegram polling, so no inbound ports / port-forwarding are needed. `nginx`
-is disabled by default (it would clash with DSM's 80/443) and Postgres/Redis are
-internal-only.
-
-1. **Enable SSH** — Control Panel → Terminal & SNMP → Enable SSH service.
-2. **Copy the project** to a shared folder, e.g. `/volume1/docker/bf1_2026`
-   (File Station upload, or `git clone` if you have the Git CLI).
-3. **Create `.env`** from the template and fill in the real values
-   (`TELEGRAM_BOT_TOKEN`, `OPENWEATHER_API_KEY`, `POSTGRES_PASSWORD`, and a
-   matching password inside `DATABASE_URL`; set `SECRET_KEY`).
-4. **Build & start** over SSH (first build is slow on the Celeron — XGBoost/PyMC
-   wheels take ~15–40 min):
-
-   ```bash
-   cd /volume1/docker/bf1_2026
-   sudo docker compose up -d --build        # nginx is skipped automatically
-   sudo docker compose ps                    # all services "healthy"
-   ```
-
-   Or via the **Container Manager GUI**: Project → Create → point it at the
-   folder (it auto-detects `docker-compose.yml`) → Build.
-5. **Populate + verify**:
-
-   ```bash
-   sudo docker exec bf1_api python -m scripts.pipeline
-   sudo docker exec bf1_api python -m scripts.healthcheck
-   ```
-6. Message your bot `/start` on Telegram.
-
-To later run the optional reverse proxy on non-DSM ports, start it with
-`docker compose --profile proxy up -d` after editing `deploy/nginx.conf`.
-
-## First-Run Data Pipeline
-
-The containers boot with empty tables. Populate them once (and whenever you want
-to refresh history) with the pipeline scripts, run inside the API container:
-
-```bash
-# Full pipeline: seed grid + 2026 calendar -> ingest history -> ELO/KPIs -> train model
+cp .env.template .env            # then edit it — see DEPLOY.md
+docker compose up -d --build
+docker exec bf1_api alembic upgrade head
 docker exec bf1_api python -m scripts.pipeline
-
-# Or run steps individually:
-docker exec bf1_api python -m scripts.seed                 # teams, grid, 2026 calendar
-docker exec bf1_api python -m scripts.ingest 2021 2025     # historical results (Ergast/OpenF1)
-docker exec bf1_api python -m scripts.build_intelligence   # ELO ratings + circuit/team KPIs
-docker exec bf1_api python -m scripts.train_model          # XGBoost position + DNF models
-```
-
-Verify everything is ready with the smoke test (checks data, runs a sample
-strategy, confirms constraints + guardrails; exits non-zero on failure):
-
-```bash
 docker exec bf1_api python -m scripts.healthcheck
 ```
 
-After the pipeline runs, the Telegram commands `/analysis`, `/simulate` and
-`/bet`, and the API `GET /api/v1/races/{id}/strategy`, return **real engine
-output** (ELO + KPIs + Monte Carlo + the trained model, all behind the
-guardrails). With no trained model the Monte Carlo layer still produces
-predictions, so the bot works even before `train_model` runs.
+`DEPLOY.md` has the full runbook, including the Synology / LAN-only setup and
+how to move an existing database to this version.
 
-All scripts are idempotent: `seed` upserts, `ingest` skips races already present,
-and `build_intelligence` recomputes ELO deterministically from scratch. The daily
-scheduler keeps data fresh after this initial load.
+### Local development
 
-## Telegram Bot Commands
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+docker compose up -d postgres redis
+alembic upgrade head
+python -m scripts.pipeline
+uvicorn app.main:app --reload --port 8000     # API
+python -m app.telegram.bot                    # bot (separate terminal)
+python -m pytest tests/ -q
+```
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Welcome message + main menu |
-| `/calendar` | 2026 race calendar with countdown |
-| `/analysis` | Complete analysis for the next race |
-| `/simulate` | Run Monte Carlo simulation (20K sims) |
-| `/bet` | Place your 15-token allocation |
-| `/leaderboard` | User rankings by BF1 points |
-| `/settings` | Configure aggressiveness level |
+## Scripts
 
-## API Endpoints
+| Command | What it does |
+|---------|--------------|
+| `python -m scripts.pipeline` | seed → sync results → build ratings/KPIs |
+| `python -m scripts.ingest [start end] [--refresh]` | sync calendar and results from the API; safe to re-run |
+| `python -m scripts.build_intelligence` | replay ratings and KPIs from stored results |
+| `python -m scripts.backtest [start end] [--events]` | score the engine against real results |
+| `python -m scripts.healthcheck` | verify data, a sample bet, and the pool connection |
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check |
-| GET | `/api/v1/races` | List races (season filter) |
-| GET | `/api/v1/races/{id}` | Race details |
-| GET | `/api/v1/races/{id}/analysis` | Race analysis |
-| GET | `/api/v1/races/{id}/strategy` | Optimal strategy |
-| GET | `/api/v1/drivers` | List active drivers |
-| GET | `/api/v1/drivers/{id}/kpis` | Driver KPIs |
-| POST | `/api/v1/bets` | Register a bet |
-| GET | `/api/v1/bets/user/{telegram_id}` | User bets |
-| GET | `/api/v1/bets/leaderboard` | Rankings |
-| POST | `/api/v1/predictions/race/{id}/simulate` | Run simulation |
+## Telegram bot
 
-## ML Models
+| Command | |
+|---------|--|
+| `/analysis` | recommended bet for the next event: chips, 11th place, expected score, deadline, and your current bet on the pool site |
+| `/simulate` | every driver's odds: win, podium, top 10, 11th, retirement |
+| `/classificacao` | the pool's real standings, your position and the gaps around you |
+| `/calendar` | the season calendar, from the database |
+| `/bet` | record the recommended bet here so it is scored after the race (it does **not** place it on the pool site) |
+| `/settings` | risk profile |
 
-### XGBoost
-Position prediction model trained on 17 features including driver ELO, team reliability, weather risk, and circuit characteristics. Uses `TimeSeriesSplit` to prevent future data leakage.
+## API
 
-### Bayesian Hierarchical
-PyMC model with driver-level priors that naturally capture uncertainty. Updated online after each race using posterior-as-prior methodology.
+| Method | Endpoint | |
+|--------|----------|--|
+| GET | `/health` | liveness |
+| GET | `/api/v1/races` · `/races/{id}` | calendar |
+| GET | `/api/v1/races/{id}/strategy?sprint=false` | recommended bet |
+| GET | `/api/v1/drivers` | active grid |
+| POST | `/api/v1/predictions/race/{id}/simulate` | whole-field odds 🔑 |
+| POST | `/api/v1/bets` | record a bet 🔑 |
+| GET | `/api/v1/bets/user/{telegram_id}` · `/bets/leaderboard` | recorded bets |
+| POST | `/api/v1/admin/update-data` · `/refresh-grid` · `/settle-bets` · `/recalculate-elo` | operations 🛡 |
 
-### Monte Carlo Simulator
-20,000 race simulations per run. Each simulation applies:
-- Gaussian grid noise
-- Stochastic DNF events (Bernoulli)
-- Safety car probability
-- Weather effects on performance
-- ELO-based performance adjustment
+🔑 needs `X-API-Key`, 🛡 needs `X-Admin-Key` (unless `REQUIRE_API_KEYS=false`
+on a private network).
 
-## KPIs
+## Scheduled jobs (UTC)
 
-**Circuit:** overtaking index, winner grid average, safety car frequency, DNF rate, rain frequency, tire degradation, temperature sensitivity
+| Job | When | |
+|-----|------|--|
+| `daily_data_update` | 02:00, 14:00 | sync results, rebuild ratings, settle recorded bets, sync pool deadlines |
+| `refresh_grid` | every 20 min, race weekends only | fetch the official starting grid |
+| `check_race_alerts` | every 30 min | 24 h and 1 h reminders |
+| `update_weather` | 08:00 | forecasts for races within 7 days |
 
-**Driver:** average finish/grid position, positions gained, performance std, DNF rate, wet performance, sprint performance, consistency index, temperature performance
+## What is deliberately not here
 
-**Team:** qualifying pace, race pace, pit stop performance, strategic error rate, mechanical reliability
+* **No trained ML model on the prediction path.** The XGBoost model
+  (`app/models_ml/xgboost_model.py`) was trained with look-ahead features and
+  is kept only as an experiment; the Bayesian model was removed. The
+  simulator's handful of parameters are checked by the backtest instead.
+* **No automatic bet placement.** Reading the pool is automated; betting on it
+  is yours to do.
 
-**Derived:** momentum, volatility, risk index, opportunity index, form trend
+## Guardrails
 
-## Guardrails (Anti-Hallucination)
-
-Models trained on sparse or unstable data can emit values outside the physical
-or regulatory domain of F1 (e.g. a "5 pit stop" projection, a probability above
-1.0, or a finishing position of 0). `app/utils/guardrails.py` is a central layer
-that **clamps every model output and logs a warning whenever a raw value had to
-be corrected** — so out-of-domain behavior is detected, not silently passed on.
-
-| Guardrail | Bound |
-|-----------|-------|
-| Pit stops, dry GP | 1–3 (4 only with high confidence **and** extreme degradation) |
-| Pit stops, Sprint **weekend** | max 2 (fewer fresh tyre sets remain) |
-| Pit stops, Sprint **race** | 0–1 |
-| Low confidence (<40%) | anchors to the historical norm instead of extrapolating |
-| Probabilities | clamped to [0, 1]; `P(top3) ≤ P(top10)` enforced |
-| Finishing position | clamped to [1, grid size] |
-| Expected points | clamped to [−10 (DNF), 26] (×2 on sprints) |
-
-The `PitStopProjector` treats an extreme raw estimate as a **critical-degradation
-signal** (a tyre-management race), not as a literal stop count — and says so in
-the strategy notes. Covered by `tests/test_guardrails.py`.
-
-## Monitoring
-
-- Health check: `GET /health`
-- Logs: `/app/logs/` (daily rotation, 30-day retention)
-- Scheduled jobs: daily data update (2 AM), weather update (8 AM), weekly retrain (Monday 3 AM)
-- PostgreSQL backups: daily at 4 AM, 30-day retention
+`app/utils/guardrails.py` clamps model outputs to the physically possible
+(probabilities in [0, 1], positions within the grid, 1-3 pit stops in a dry
+race) and logs whenever it had to correct something.

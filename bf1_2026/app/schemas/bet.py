@@ -3,13 +3,20 @@
 import uuid
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
 class BetCreate(BaseModel):
     race_id: uuid.UUID
-    strategy_type: str = "balanced"
+    strategy_type: Literal["conservative", "balanced", "aggressive", "ultra_aggressive"] = (
+        "balanced"
+    )
     allocations: dict[str, int]
+    # The driver picked to finish 11th (+50 points when right). Optional here
+    # so a chips-only bet can still be recorded.
+    eleventh_driver_id: uuid.UUID | None = None
 
     @field_validator("allocations")
     @classmethod
@@ -32,6 +39,8 @@ class BetResponse(BaseModel):
     total_tokens: int
     allocations: dict
     expected_value: float
+    eleventh_driver_id: uuid.UUID | None = None
+    eleventh_hit: bool | None = None
     confirmed_at: datetime | None
     actual_points: float | None
     status: str
